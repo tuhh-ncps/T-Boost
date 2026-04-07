@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# data files
+*.csv
+*.json
+*.h5
+*.pt
+*.log
+*.ckpt
+data/
+archieve/
+
+# results
+results/
+*.pdf
+*.png
+*.jpg
+*.pdf
