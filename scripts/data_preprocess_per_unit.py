@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""Preprocess event logs from data/ into per-file CSV outputs.
+"""Preprocess event logs from data/ into per-file CSV outputs split by next_time range.
 
-For each input log file, this script creates one CSV in data_csv/ and enriches
-rows with process-oriented features:
+For each input log file, this script creates up to four CSV files in data_csv/:
+- <dataset>_second.csv: rows with next_time_seconds <= 60
+- <dataset>_minute.csv: rows with 60 < next_time_seconds <= 3600
+- <dataset>_hour.csv: rows with 3600 < next_time_seconds <= 86400
+- <dataset>_day.csv: rows with next_time_seconds > 86400
+
+Each row is enriched with process-oriented features:
 - prefix_sequence: all preceding activities in the case (comma-separated)
 - prefix_delta_t_sequence: time gaps between consecutive prefix events (comma-separated)
 - time_span: duration within the prefix history (max prefix timestamp - min prefix timestamp)
-- next_time: time to next event in the same case
-- next_time_seconds: time to next event in seconds
+- next_time: time to next event in the same case, represented in --time-unit
+- next_time_seconds: time to next event in seconds (used for per-unit file splitting)
 - next_activity: activity label of next event in the same case
-- time_unit: unit used for temporal features (seconds/minutes/hours/days)
-- time_bucket: optional bucket size used for temporal rounding in preprocessing
- - time_regime: quantile class derived from log1p(next_time) (q1, q2, q3, q4)
+- time_unit: unit used for time_span and next_time
 
 Input selection:
     Use --data-dir for the input folder. Optionally use --dataset to process
     only one file from that folder.
 
 Example:
-    python scripts/data_preprocess.py --data-dir data --output-dir data_csv
+    python scripts/data_preprocess_per_unit.py --data-dir data --output-dir data_csv
 
 Usage:
-    --data-dir PATH      Input directory with .xes/.zip/.csv logs (default: data)
-    --output-dir PATH    Output directory for generated CSV files (default: data_csv)
-    --time-unit UNIT     seconds, minutes, hours, or days (default: seconds)
-    --time-bucket N      Optional rounding bucket in the selected time unit (default: 0)
-    --dataset NAME       Process only one dataset file
-    --test-size RATIO    Fraction of rows written to the test split (default: 0.2)
+    --data-dir PATH   Input directory with .xes/.zip/.csv logs (default: data)
+    --output-dir PATH Output directory for generated CSV files (default: data_csv)
+    --time-unit UNIT  seconds, minutes, hours, or days (default: seconds)
+    --dataset NAME    Process only one dataset file
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-import numpy as np
 import pandas as pd
 import pm4py
 from pm4py.objects.log.obj import EventLog, Trace
@@ -59,7 +59,7 @@ CASE_COL_CANDIDATES = [
     "case id",
     "case_id",
     "caseid",
-    "caseid"
+    "caseid",
 ]
 ACTIVITY_COL_CANDIDATES = [
     "concept:name",
@@ -67,7 +67,7 @@ ACTIVITY_COL_CANDIDATES = [
     "event",
     "task",
     "activityid",
-    "activity id"
+    "activity id",
 ]
 TIMESTAMP_COL_CANDIDATES = [
     "time:timestamp",
@@ -76,13 +76,17 @@ TIMESTAMP_COL_CANDIDATES = [
     "date",
     "datetime",
     "completetimestamp",
-    "complete_timestamp"
+    "complete_timestamp",
 ]
+
+SECONDS_PER_MINUTE = 60.0
+SECONDS_PER_HOUR = 3600.0
+SECONDS_PER_DAY = 86400.0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert logs in data/ to enriched CSV files in data_csv/."
+        description="Convert logs in data/ to enriched CSV files split by next_time ranges."
     )
     parser.add_argument(
         "--data-dir",
@@ -103,22 +107,10 @@ def parse_args() -> argparse.Namespace:
         help="Unit used for time_span and next_time (default: seconds)",
     )
     parser.add_argument(
-        "--time-bucket",
-        type=float,
-        default=0.0,
-        help="Optional temporal bucket size in selected --time-unit. 0 disables bucketing (default: 0)",
-    )
-    parser.add_argument(
         "--dataset",
         type=str,
         default=None,
         help="Specific dataset file to process (e.g., helpdesk.csv). If omitted, processes all files in --data-dir",
-    )
-    parser.add_argument(
-        "--test-size",
-        type=float,
-        default=0.2,
-        help="Fraction of rows written to <dataset>_test.csv (default: 0.2)",
     )
     return parser.parse_args()
 
@@ -176,24 +168,8 @@ def _find_matching_column(df: pd.DataFrame, candidates: List[str]) -> str | None
     return None
 
 
-def _detect_csv_delimiter(file_path: Path) -> str:
-    sample = file_path.read_text(encoding="utf-8", errors="ignore")[:4096]
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
-        return dialect.delimiter
-    except csv.Error:
-        semicolons = sample.count(";")
-        commas = sample.count(",")
-        if semicolons > commas:
-            return ";"
-        if commas > 0:
-            return ","
-        return ";"
-
-
 def read_csv_as_event_log(file_path: Path) -> EventLog:
-    delimiter = _detect_csv_delimiter(file_path)
-    df = pd.read_csv(file_path, low_memory=False, sep=delimiter)
+    df = pd.read_csv(file_path, low_memory=False)
 
     case_col = _find_matching_column(df, CASE_COL_CANDIDATES)
     activity_col = _find_matching_column(df, ACTIVITY_COL_CANDIDATES)
@@ -275,49 +251,10 @@ def duration_in_unit(start: datetime, end: datetime, unit: str) -> float:
     if unit == "seconds":
         return seconds
     if unit == "minutes":
-        return seconds / 60.0
+        return seconds / SECONDS_PER_MINUTE
     if unit == "hours":
-        return seconds / 3600.0
-    return seconds / 86400.0
-
-
-def bucket_nonnegative(value: float, bucket: float) -> float:
-    value = max(0.0, float(value))
-    if bucket <= 0:
-        return value
-    return float(round(value / bucket) * bucket)
-
-
-def assign_quantile_time_regime(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "next_time" not in out.columns:
-        raise ValueError("Column 'next_time' is required to build quantile-based time_regime")
-
-    next_time_numeric = pd.to_numeric(out["next_time"], errors="coerce")
-    valid_mask = next_time_numeric.notna() & (next_time_numeric > 0)
-    out["time_regime"] = "q1"
-
-    # qcut may drop duplicate bin edges if data has many ties, so derive q-labels
-    # from returned bin codes instead of assuming exactly 4 bins always exist.
-    # Apply log1p transformation to align with evaluation script binning.
-    if valid_mask.any():
-        try:
-            log_next_time = np.log1p(next_time_numeric[valid_mask])
-            quantile_codes = pd.qcut(
-                log_next_time,
-                q=4,
-                labels=False,
-                duplicates="drop",
-            )
-            quantile_labels = quantile_codes.map(
-                lambda code: f"q{int(code) + 1}" if pd.notna(code) else "q1"
-            )
-            out.loc[valid_mask, "time_regime"] = quantile_labels.astype(str)
-        except ValueError:
-            out.loc[valid_mask, "time_regime"] = "q1"
-
-    out["time_regime"] = out["time_regime"].astype(str)
-    return out
+        return seconds / SECONDS_PER_HOUR
+    return seconds / SECONDS_PER_DAY
 
 
 def collect_columns(log: EventLog) -> List[str]:
@@ -334,9 +271,6 @@ def collect_columns(log: EventLog) -> List[str]:
         "next_time_seconds",
         "next_activity",
         "time_unit",
-        "time_bucket",
-        "pre_time_regime",
-        "time_regime",
     }
 
     for trace in log:
@@ -358,9 +292,6 @@ def collect_columns(log: EventLog) -> List[str]:
         "next_time_seconds",
         "next_activity",
         "time_unit",
-        "time_bucket",
-        "pre_time_regime",
-        "time_regime",
     ]
 
     others = sorted(c for c in base_cols if c not in preferred_order)
@@ -374,23 +305,17 @@ def row_for_event(
     activities: List[str],
     timestamps: List[datetime | None],
     unit: str,
-    bucket: float,
 ) -> Dict[str, str]:
     event = trace[event_index]
     current_ts = timestamps[event_index]
     has_next = event_index + 1 < len(timestamps)
     next_ts = timestamps[event_index + 1] if has_next else None
 
-    # Required behavior: when next timestamp is missing, fill next_time with 0.
     if current_ts is not None and next_ts is not None:
         next_time_seconds = max(0.0, (next_ts - current_ts).total_seconds())
-        next_time = duration_in_unit(current_ts, next_ts, unit)
     else:
         next_time_seconds = 0.0
-        next_time = 0.0
-    next_time = bucket_nonnegative(next_time, bucket)
-    # This value is overwritten later by quantile assignment on full dataframe.
-    time_regime = "q1"
+    next_time = duration_in_unit(current_ts, next_ts, unit) if (current_ts is not None and next_ts is not None) else 0.0
 
     prefix = ",".join(a for a in activities[:event_index] if a)
 
@@ -402,15 +327,14 @@ def row_for_event(
             prefix_delta_t.append(0.0)
         else:
             delta_value = duration_in_unit(previous_ts, prefix_ts_value, unit)
-            prefix_delta_t.append(bucket_nonnegative(delta_value, bucket))
+            prefix_delta_t.append(max(0.0, float(delta_value)))
         previous_ts = prefix_ts_value
 
-    # time_span is computed from timestamps in the prefix sequence only.
     if len(prefix_ts) >= 2:
         prefix_span = duration_in_unit(min(prefix_ts), max(prefix_ts), unit)
     else:
         prefix_span = 0.0
-    prefix_span = bucket_nonnegative(prefix_span, bucket)
+    prefix_span = max(0.0, float(prefix_span))
 
     if has_next:
         candidate_next_activity = activities[event_index + 1].strip()
@@ -430,8 +354,6 @@ def row_for_event(
         "next_time_seconds": f"{float(next_time_seconds):.6f}",
         "next_activity": next_activity,
         "time_unit": unit,
-        "time_bucket": f"{float(bucket):.6f}",
-        "time_regime": time_regime,
     }
 
     for key, value in trace.attributes.items():
@@ -443,113 +365,80 @@ def row_for_event(
     return row
 
 
-def iter_enriched_rows(log: EventLog, unit: str, bucket: float) -> Iterable[Dict[str, str]]:
+def iter_enriched_rows(log: EventLog, unit: str) -> Iterable[Dict[str, str]]:
     for case_index, trace in enumerate(log, start=1):
         activities = [str(event.get("concept:name", "")).strip() for event in trace]
         timestamps = [parse_timestamp(event.get("time:timestamp")) for event in trace]
 
         for event_index in range(len(trace)):
-            yield row_for_event(trace, event_index, case_index, activities, timestamps, unit, bucket)
+            yield row_for_event(trace, event_index, case_index, activities, timestamps, unit)
 
 
-def output_name(input_file: Path) -> str:
-    # Keep name aligned with source file while normalizing extension to .csv.
-    return f"{input_file.stem}.csv"
+def output_name(base_stem: str, bucket_name: str) -> str:
+    return f"{base_stem}_{bucket_name}.csv"
 
 
-def write_csv(log: EventLog, output_path: Path, unit: str, bucket: float) -> None:
+def classify_next_time_bucket(next_time_seconds: float) -> str:
+    # Inclusive boundaries avoid dropping transition values (60, 3600, 86400).
+    if next_time_seconds <= SECONDS_PER_MINUTE:
+        return "second"
+    if next_time_seconds <= SECONDS_PER_HOUR:
+        return "minute"
+    if next_time_seconds <= SECONDS_PER_DAY:
+        return "hour"
+    return "day"
+
+
+def write_split_csvs(log: EventLog, input_file: Path, output_dir: Path, unit: str) -> List[Path]:
     columns = collect_columns(log)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    with output_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
-        writer.writeheader()
-        for row in iter_enriched_rows(log, unit, bucket):
-            writer.writerow({col: row.get(col, "") for col in columns})
+    rows_by_bucket: Dict[str, List[Dict[str, str]]] = {
+        "second": [],
+        "minute": [],
+        "hour": [],
+        "day": [],
+    }
 
+    for row in iter_enriched_rows(log, unit):
+        next_time_seconds = float(row.get("next_time_seconds", 0.0))
+        bucket_name = classify_next_time_bucket(next_time_seconds)
+        rows_by_bucket[bucket_name].append(row)
 
-def write_train_test_split(output_path: Path, test_size: float) -> tuple[Path, Path]:
-    df = pd.read_csv(output_path, low_memory=False)
-    # Compute preprocessing quantile regimes (log1p-based) and preserve them
-    assigned = assign_quantile_time_regime(df.copy())
-    # Store assigned regimes as pre_time_regime—this captures the preprocessing-phase labels
-    # before any downstream reassignment (e.g., by decision_tree_time_regime.py)
-    df["pre_time_regime"] = assigned["time_regime"].astype(str)
-    # Set the working time_regime to the assigned regimes (this may be reassigned later)
-    df["time_regime"] = assigned["time_regime"].astype(str)
+    written_files: List[Path] = []
+    for bucket_name, rows in rows_by_bucket.items():
+        output_path = output_dir / output_name(input_file.stem, bucket_name)
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({col: row.get(col, "") for col in columns})
+        written_files.append(output_path)
 
-    if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        ordered = (
-            df.assign(__timestamp_sort=ts)
-            .sort_values("__timestamp_sort", kind="mergesort", na_position="last")
-            .drop(columns=["__timestamp_sort"])
-            .reset_index(drop=True)
-        )
-    else:
-        ordered = df.reset_index(drop=True)
-
-    n_rows = len(ordered)
-    if n_rows < 2:
-        train_df = ordered
-        test_df = ordered.iloc[0:0].copy()
-    else:
-        safe_test_size = min(max(float(test_size), 0.0), 0.9)
-        n_test = max(1, int(round(n_rows * safe_test_size)))
-        if n_test >= n_rows:
-            n_test = n_rows - 1
-        split_idx = n_rows - n_test
-        train_df = ordered.iloc[:split_idx].copy()
-        test_df = ordered.iloc[split_idx:].copy()
-
-    train_path = output_path.with_name(f"{output_path.stem}_train.csv")
-    test_path = output_path.with_name(f"{output_path.stem}_test.csv")
-    ordered.to_csv(output_path, index=False)
-    train_df.to_csv(train_path, index=False)
-    test_df.to_csv(test_path, index=False)
-    return train_path, test_path
+    return written_files
 
 
-def process_file(
-    input_file: Path,
-    output_dir: Path,
-    unit: str,
-    bucket: float,
-    test_size: float,
-) -> tuple[Path, Path, Path]:
+def process_file(input_file: Path, output_dir: Path, unit: str) -> List[Path]:
     log = read_log(input_file)
-    output_path = output_dir / output_name(input_file)
-    write_csv(log, output_path, unit, bucket)
-    train_path, test_path = write_train_test_split(output_path, test_size)
-    return output_path, train_path, test_path
+    return write_split_csvs(log, input_file, output_dir, unit)
 
 
 def main() -> None:
     args = parse_args()
-    
-    # Determine which files to process
+
     if args.dataset:
-        # Process a specific dataset
         input_file = args.data_dir / args.dataset
         if not input_file.exists():
             raise FileNotFoundError(f"Dataset not found: {input_file}")
         files = [input_file]
     else:
-        # Process all files in the directory
         files = list_input_files(args.data_dir)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for input_file in files:
-        output_file, train_file, test_file = process_file(
-            input_file,
-            args.output_dir,
-            args.time_unit,
-            args.time_bucket,
-            args.test_size,
-        )
-        print(f"Processed {input_file.name} -> {output_file}")
-        print(f"Split {input_file.name} -> {train_file}")
-        print(f"Split {input_file.name} -> {test_file}")
+        output_files = process_file(input_file, args.output_dir, args.time_unit)
+        for output_file in output_files:
+            print(f"Processed {input_file.name} -> {output_file}")
 
 
 if __name__ == "__main__":

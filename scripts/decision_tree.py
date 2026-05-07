@@ -8,9 +8,27 @@ requested feature set:
 - prefix_sequence
 - time_span
 - next_activity (also accepts the misspelled next_actvity)
+- predicted_time_regime_q1_pct
+- predicted_time_regime_q2_pct
+- predicted_time_regime_q3_pct
 
 Target label:
 - next_time
+
+Input selection:
+    Use --data-dir for the split CSV folder. Optionally use --dataset to train
+    only one dataset stem.
+
+Example:
+    python scripts/decision_tree.py --data-dir data_csv --result-dir results/decision_tree
+
+Usage:
+    --data-dir PATH           Folder containing input CSV files
+    --result-dir PATH         Folder for models and reports
+    --dataset NAME            Optional single CSV file to train
+    --preceding-k N           Number of preceding activities to encode
+    --max-depth-limit N       Upper bound for max_depth tuning
+    --use-next-activity       Include next_activity as model input
 """
 
 from __future__ import annotations
@@ -33,7 +51,13 @@ from sklearn.tree import DecisionTreeRegressor
 
 DEFAULT_DATA_DIR = Path("data_csv")
 DEFAULT_RESULT_DIR = Path("results/decision_tree")
-PREFIX_K = 6
+DEFAULT_PRECEDING_K = 3
+SECONDS_PER_DAY = 86400.0
+SOFT_REGIME_COLUMNS = [
+    "predicted_time_regime_q1_pct",
+    "predicted_time_regime_q2_pct",
+    "predicted_time_regime_q3_pct",
+]
 
 
 def _stable_file_seed(base_seed: int, file_name: str) -> int:
@@ -58,12 +82,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional single CSV filename to train (e.g., BPI12.csv). Default trains all CSVs.",
-    )
-    parser.add_argument(
-        "--next-activity-noise-rate",
-        type=float,
-        default=0.05,
-        help="Probability of replacing next_activity with a different value (default: 0.05)",
     )
     parser.add_argument(
         "--max-rows-per-file",
@@ -107,6 +125,12 @@ def parse_args() -> argparse.Namespace:
         help="Upper bound for max_depth tuning (default: 10)",
     )
     parser.add_argument(
+        "--preceding-k",
+        type=int,
+        default=DEFAULT_PRECEDING_K,
+        help="Number of preceding activities to encode as prefix features (default: 3)",
+    )
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=2,
@@ -129,6 +153,55 @@ def list_csv_files(data_dir: Path) -> List[Path]:
     if not files:
         raise FileNotFoundError(f"No CSV files found in {data_dir}")
     return files
+
+
+def strip_known_suffixes(stem: str) -> str:
+    for suffix in ("_train_with_time_regime", "_test_with_time_regime", "_train", "_test"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def build_dataset_pairs(data_dir: Path, dataset: str) -> List[Tuple[str, Path, Path]]:
+    files = list_csv_files(data_dir)
+    by_name = {p.name: p for p in files}
+    pairs: List[Tuple[str, Path, Path]] = []
+
+    if dataset:
+        stem = strip_known_suffixes(Path(dataset).stem)
+        train_name = f"{stem}_train_with_time_regime.csv"
+        if train_name not in by_name:
+            train_name = f"{stem}_train.csv"
+        test_name = f"{stem}_test_with_time_regime.csv"
+        if test_name not in by_name:
+            test_name = f"{stem}_test.csv"
+        if train_name not in by_name:
+            raise FileNotFoundError(f"Train split not found in {data_dir}: {train_name}")
+        if test_name not in by_name:
+            raise FileNotFoundError(f"Test split not found in {data_dir}: {test_name}")
+        return [(stem, by_name[train_name], by_name[test_name])]
+
+    for path in files:
+        if not path.stem.endswith("_train"):
+            continue
+        stem = strip_known_suffixes(path.stem)
+        soft_train_name = f"{stem}_train_with_time_regime.csv"
+        if soft_train_name in by_name:
+            path = by_name[soft_train_name]
+        test_name = f"{stem}_test_with_time_regime.csv"
+        test_path = by_name.get(test_name)
+        if test_path is None:
+            test_path = by_name.get(f"{stem}_test.csv")
+        if test_path is None:
+            continue
+        pairs.append((stem, path, test_path))
+
+    if not pairs:
+        raise FileNotFoundError(
+            f"No train/test pairs found in {data_dir}. Expected <dataset>_train.csv and <dataset>_test_with_time_regime.csv"
+        )
+
+    return sorted(pairs, key=lambda item: item[0])
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -157,7 +230,11 @@ def validate_required_columns(df: pd.DataFrame) -> Tuple[List[str], str]:
     return feature_cols, target_col
 
 
-def split_prefix_sequence(value: object, k: int = PREFIX_K) -> List[str]:
+def has_soft_regime_columns(df: pd.DataFrame) -> bool:
+    return all(col in df.columns for col in SOFT_REGIME_COLUMNS)
+
+
+def split_prefix_sequence(value: object, k: int) -> List[str]:
     if pd.isna(value):
         parts: List[str] = []
     else:
@@ -173,7 +250,7 @@ def split_prefix_sequence(value: object, k: int = PREFIX_K) -> List[str]:
     return parts
 
 
-def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+def coerce_types(df: pd.DataFrame, preceding_k: int) -> pd.DataFrame:
     out = df.copy()
 
     ts = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
@@ -186,8 +263,12 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     out["time_span"] = pd.to_numeric(out["time_span"], errors="coerce")
     out["next_time"] = pd.to_numeric(out["next_time"], errors="coerce")
 
-    prefix_values = out["prefix_sequence"].apply(split_prefix_sequence)
-    for i in range(PREFIX_K):
+    for col in SOFT_REGIME_COLUMNS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    prefix_values = out["prefix_sequence"].apply(lambda value: split_prefix_sequence(value, k=preceding_k))
+    for i in range(preceding_k):
         out[f"prefix_{i + 1}"] = prefix_values.str[i]
 
     numeric_cols = ["timestamp_epoch", "time_span", "ts_dayofweek", "ts_hour", "ts_month"]
@@ -195,11 +276,11 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
     # Use plain object dtype + np.nan so sklearn imputers handle missing values reliably.
-    for col in ["activity", "prefix_sequence", "next_activity"]:
+    for col in ["activity", "prefix_sequence", "next_activity", "time_regime"]:
         out[col] = out[col].astype("object")
         out.loc[out[col].isna(), col] = np.nan
 
-    for i in range(PREFIX_K):
+    for i in range(preceding_k):
         col = f"prefix_{i + 1}"
         out[col] = out[col].astype("object")
         out.loc[out[col].isna(), col] = "START"
@@ -244,35 +325,15 @@ def inject_next_activity_noise(df: pd.DataFrame, noise_rate: float, random_state
     return out
 
 
-def get_model_feature_columns() -> List[str]:
-    return [
-        "activity",
-        "next_activity",
-        "prefix_1",
-        "prefix_2",
-        "prefix_3",
-        "timestamp_epoch",
-        "time_span",
-        "ts_dayofweek",
-        "ts_hour",
-        "ts_month",
-    ]
-
-
-def temporal_split(df: pd.DataFrame, test_size: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ordered = df.sort_values("timestamp_epoch", kind="mergesort", na_position="last").reset_index(drop=True)
-    n_rows = len(ordered)
-    if n_rows < 2:
-        return ordered, ordered.iloc[0:0]
-
-    n_test = max(1, int(round(n_rows * test_size)))
-    if n_test >= n_rows:
-        n_test = n_rows - 1
-    split_idx = n_rows - n_test
-
-    train_df = ordered.iloc[:split_idx].copy()
-    test_df = ordered.iloc[split_idx:].copy()
-    return train_df, test_df
+def get_model_feature_columns(preceding_k: int, use_soft_regime: bool) -> List[str]:
+    cols = ["activity"]
+    if use_soft_regime:
+        cols.extend(SOFT_REGIME_COLUMNS)
+    else:
+        cols.append("time_regime")
+    cols.extend([f"prefix_{i + 1}" for i in range(preceding_k)])
+    cols.extend(["timestamp_epoch", "time_span", "ts_dayofweek", "ts_hour", "ts_month"])
+    return cols
 
 
 def limit_train_cases(train_df: pd.DataFrame, max_train_cases: int) -> pd.DataFrame:
@@ -307,6 +368,7 @@ def tune_best_depth(
     X_test: pd.DataFrame,
     y_test: pd.Series,
     args: argparse.Namespace,
+    use_soft_regime: bool,
 ) -> Tuple[Pipeline, int, Tuple[float, float, float], int, bool]:
     best_pipeline: Pipeline | None = None
     best_depth = 1
@@ -317,7 +379,12 @@ def tune_best_depth(
 
     for depth in range(1, max(2, args.max_depth_limit + 1)):
         depths_tried += 1
-        pipeline = build_model_pipeline(args.random_state, max_depth=depth)
+        pipeline = build_model_pipeline(
+            random_state=args.random_state,
+            max_depth=depth,
+            preceding_k=args.preceding_k,
+            use_soft_regime=use_soft_regime,
+        )
         pipeline.fit(X_train, y_train)
         y_pred = pipeline.predict(X_test)
 
@@ -353,10 +420,20 @@ def tune_best_depth(
     return best_pipeline, best_depth, best_scores, depths_tried, stopped_early
 
 
-def build_model_pipeline(random_state: int, max_depth: int) -> Pipeline:
+def build_model_pipeline(
+    random_state: int,
+    max_depth: int,
+    preceding_k: int,
+    use_soft_regime: bool,
+) -> Pipeline:
     # Keep timestamp_epoch only for temporal split, not as a training feature.
     numeric_features = ["time_span", "ts_dayofweek", "ts_hour", "ts_month"]
-    categorical_features = ["activity", "next_activity", "prefix_1", "prefix_2", "prefix_3"]
+    if use_soft_regime:
+        numeric_features = [*numeric_features, *SOFT_REGIME_COLUMNS]
+        categorical_features = ["activity"]
+    else:
+        categorical_features = ["activity", "time_regime"]
+    categorical_features.extend([f"prefix_{i + 1}" for i in range(preceding_k)])
 
     numeric_transformer = Pipeline(
         steps=[
@@ -389,50 +466,76 @@ def build_model_pipeline(random_state: int, max_depth: int) -> Pipeline:
     return pipeline
 
 
-def train_one_file(csv_path: Path, args: argparse.Namespace) -> Dict[str, object]:
-    raw_data = load_single_dataset(csv_path, args.max_rows_per_file)
-    _, target_col = validate_required_columns(raw_data)
+def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str, args: argparse.Namespace) -> Dict[str, object]:
+    raw_train_data = load_single_dataset(train_csv_path, args.max_rows_per_file)
+    raw_test_data = load_single_dataset(test_csv_path, args.max_rows_per_file)
 
-    data = coerce_types(raw_data)
-    data["__row_id"] = data.index
+    use_soft_regime = has_soft_regime_columns(raw_train_data) and has_soft_regime_columns(raw_test_data)
+    regime_feature_mode = "soft_probabilities" if use_soft_regime else "hard_label"
+    regime_feature_columns = ",".join(SOFT_REGIME_COLUMNS if use_soft_regime else ["time_regime"])
 
-    train_df = data.dropna(subset=[target_col]).copy()
-    if len(train_df) < 2:
+    # For pipeline usage, prefer inferred/predicted regime in test split when available.
+    if "predicted_time_regime" in raw_test_data.columns:
+        raw_test_data = raw_test_data.copy()
+        raw_test_data["time_regime"] = raw_test_data["predicted_time_regime"]
+
+    if not use_soft_regime:
+        missing_regime = [col for col in ["time_regime"] if col not in raw_train_data.columns or col not in raw_test_data.columns]
+        if missing_regime:
+            raise ValueError(f"Missing required time-regime columns for legacy fallback: {missing_regime}")
+
+    _, target_col = validate_required_columns(raw_train_data)
+    validate_required_columns(raw_test_data)
+
+    if args.preceding_k <= 0:
+        raise ValueError("--preceding-k must be a positive integer")
+
+    train_data = coerce_types(raw_train_data, preceding_k=args.preceding_k)
+    test_data = coerce_types(raw_test_data, preceding_k=args.preceding_k)
+    train_data["__row_id"] = train_data.index
+    test_data["__row_id"] = test_data.index
+
+    train_df = train_data.dropna(subset=[target_col]).copy()
+    test_df = test_data.dropna(subset=[target_col]).copy()
+    if len(train_df) < 2 or len(test_df) < 1:
         return {
-            "file": csv_path.name,
-            "rows_total": int(len(data)),
-            "rows_used_for_training": int(len(train_df)),
+            "file": f"{dataset_stem}.csv",
+            "train_file": train_csv_path.name,
+            "test_file": test_csv_path.name,
+            "rows_total": int(len(train_data) + len(test_data)),
+            "rows_used_for_training": int(len(train_df) + len(test_df)),
             "rows_train": 0,
             "rows_test": 0,
             "mae": np.nan,
+            "mae_days": np.nan,
             "rmse": np.nan,
             "r2": np.nan,
             "model_path": "",
             "status": "skipped_not_enough_rows",
         }
-
-    noise_seed = _stable_file_seed(args.random_state, csv_path.name)
-    train_df = inject_next_activity_noise(train_df, args.next_activity_noise_rate, noise_seed)
-
-    train_part, test_part = temporal_split(train_df, args.test_size)
-
-    # Optional static cap before any auto-stop search.
-    train_part = limit_train_cases(train_part, args.max_train_cases)
+    train_part = limit_train_cases(train_df, args.max_train_cases)
+    test_part = test_df
     if train_part.empty or test_part.empty:
         return {
-            "file": csv_path.name,
-            "rows_total": int(len(data)),
-            "rows_used_for_training": int(len(train_df)),
+            "file": f"{dataset_stem}.csv",
+            "train_file": train_csv_path.name,
+            "test_file": test_csv_path.name,
+            "rows_total": int(len(train_data) + len(test_data)),
+            "rows_used_for_training": int(len(train_df) + len(test_df)),
             "rows_train": int(len(train_part)),
             "rows_test": int(len(test_part)),
             "mae": np.nan,
+            "mae_days": np.nan,
             "rmse": np.nan,
             "r2": np.nan,
             "model_path": "",
-            "status": "skipped_invalid_temporal_split",
+            "status": "skipped_invalid_split_files",
         }
 
-    feature_cols = get_model_feature_columns()
+    feature_cols = get_model_feature_columns(
+        preceding_k=args.preceding_k,
+        use_soft_regime=use_soft_regime,
+    )
     X_test = test_part[feature_cols]
     y_test = test_part[target_col]
 
@@ -461,7 +564,14 @@ def train_one_file(csv_path: Path, args: argparse.Namespace) -> Dict[str, object
 
             X_train_candidate = candidate_train_part[feature_cols]
             y_train_candidate = candidate_train_part[target_col]
-            tuned = tune_best_depth(X_train_candidate, y_train_candidate, X_test, y_test, args)
+            tuned = tune_best_depth(
+                X_train_candidate,
+                y_train_candidate,
+                X_test,
+                y_test,
+                args,
+                use_soft_regime=use_soft_regime,
+            )
             _, _, candidate_scores, _, _ = tuned
             candidate_mae = float(candidate_scores[0])
             case_cutoffs_evaluated += 1
@@ -485,19 +595,29 @@ def train_one_file(csv_path: Path, args: argparse.Namespace) -> Dict[str, object
             X_train_fallback = selected_train_part[feature_cols]
             y_train_fallback = selected_train_part[target_col]
             best_pipeline, best_depth, best_scores, depths_tried, stopped_early = tune_best_depth(
-                X_train_fallback, y_train_fallback, X_test, y_test, args
+                X_train_fallback,
+                y_train_fallback,
+                X_test,
+                y_test,
+                args,
+                use_soft_regime=use_soft_regime,
             )
     else:
         X_train_base = selected_train_part[feature_cols]
         y_train_base = selected_train_part[target_col]
         best_pipeline, best_depth, best_scores, depths_tried, stopped_early = tune_best_depth(
-            X_train_base, y_train_base, X_test, y_test, args
+            X_train_base,
+            y_train_base,
+            X_test,
+            y_test,
+            args,
+            use_soft_regime=use_soft_regime,
         )
 
     mae, rmse, r2 = best_scores
+    mae_days = float(mae) / SECONDS_PER_DAY
     train_part = selected_train_part
     X_train = train_part[feature_cols]
-    y_train = train_part[target_col]
 
     # Build detailed prediction output per dataset.
     y_pred_train = best_pipeline.predict(X_train)
@@ -509,40 +629,77 @@ def train_one_file(csv_path: Path, args: argparse.Namespace) -> Dict[str, object
     test_part["prediction_next_time"] = y_pred_test
     train_part["split"] = "train"
     test_part["split"] = "test"
+    train_part["regime_feature_mode"] = regime_feature_mode
+    test_part["regime_feature_mode"] = regime_feature_mode
+    train_part["regime_feature_columns"] = regime_feature_columns
+    test_part["regime_feature_columns"] = regime_feature_columns
 
     prediction_rows = pd.concat([train_part, test_part], ignore_index=True)
     prediction_rows = prediction_rows.sort_values("__row_id", kind="mergesort")
 
-    input_cols = list(raw_data.columns)
-    raw_with_row_id = raw_data.copy()
-    raw_with_row_id["__row_id"] = raw_with_row_id.index
-
-    prediction_export = raw_with_row_id.merge(
-        prediction_rows[["__row_id", "split", "prediction_next_time"]],
+    train_input_cols = list(raw_train_data.columns)
+    raw_train_with_row_id = raw_train_data.copy()
+    raw_train_with_row_id["__row_id"] = raw_train_with_row_id.index
+    train_export = raw_train_with_row_id.merge(
+        train_part[["__row_id", "split", "prediction_next_time", "regime_feature_mode", "regime_feature_columns"]],
         on="__row_id",
         how="inner",
     )
-    prediction_export["actual_next_time"] = pd.to_numeric(prediction_export["next_time"], errors="coerce")
-    prediction_export["prediction_error"] = (
-        prediction_export["actual_next_time"] - prediction_export["prediction_next_time"]
+    train_export["actual_next_time"] = pd.to_numeric(train_export["next_time"], errors="coerce")
+    train_export["prediction_error"] = train_export["actual_next_time"] - train_export["prediction_next_time"]
+    train_export = train_export[
+        train_input_cols
+        + [
+            "split",
+            "regime_feature_mode",
+            "regime_feature_columns",
+            "actual_next_time",
+            "prediction_next_time",
+            "prediction_error",
+        ]
+    ]
+
+    test_input_cols = list(raw_test_data.columns)
+    raw_test_with_row_id = raw_test_data.copy()
+    raw_test_with_row_id["__row_id"] = raw_test_with_row_id.index
+    test_export = raw_test_with_row_id.merge(
+        test_part[["__row_id", "split", "prediction_next_time", "regime_feature_mode", "regime_feature_columns"]],
+        on="__row_id",
+        how="inner",
     )
-    prediction_export = prediction_export[input_cols + ["split", "actual_next_time", "prediction_next_time", "prediction_error"]]
+    test_export["actual_next_time"] = pd.to_numeric(test_export["next_time"], errors="coerce")
+    test_export["prediction_error"] = test_export["actual_next_time"] - test_export["prediction_next_time"]
+    test_export = test_export[
+        test_input_cols
+        + [
+            "split",
+            "regime_feature_mode",
+            "regime_feature_columns",
+            "actual_next_time",
+            "prediction_next_time",
+            "prediction_error",
+        ]
+    ]
+
+    prediction_export = pd.concat([train_export, test_export], ignore_index=True)
 
     models_dir = args.result_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
-    model_path = models_dir / f"{csv_path.stem}_decision_tree_next_time.pkl"
+    model_path = models_dir / f"{dataset_stem}_decision_tree_next_time.pkl"
     with model_path.open("wb") as handle:
         pickle.dump(best_pipeline, handle)
 
     predictions_dir = args.result_dir / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
-    prediction_path = predictions_dir / f"{csv_path.stem}_prediction.csv"
+    prediction_path = predictions_dir / f"{dataset_stem}_prediction.csv"
     prediction_export.to_csv(prediction_path, index=False)
 
     return {
-        "file": csv_path.name,
-        "rows_total": int(len(data)),
-        "rows_used_for_training": int(len(train_df)),
+        "file": f"{dataset_stem}.csv",
+        "train_file": train_csv_path.name,
+        "test_file": test_csv_path.name,
+        "rows_total": int(len(train_data) + len(test_data)),
+        "rows_used_for_training": int(len(train_df) + len(test_df)),
         "rows_train": int(len(X_train)),
         "rows_test": int(len(X_test)),
         "auto_stop_by_mae": bool(args.auto_stop_by_mae),
@@ -550,8 +707,12 @@ def train_one_file(csv_path: Path, args: argparse.Namespace) -> Dict[str, object
         "case_cutoffs_evaluated": int(case_cutoffs_evaluated),
         "case_search_stopped_early": bool(case_search_stopped_early),
         "max_train_cases": int(args.max_train_cases),
+        "preceding_k": int(args.preceding_k),
+        "regime_feature_mode": regime_feature_mode,
+        "regime_feature_columns": regime_feature_columns,
         "train_cases_used": int(train_part["case_index"].nunique()) if "case_index" in train_part.columns else np.nan,
         "mae": float(mae),
+        "mae_days": float(mae_days),
         "rmse": float(rmse),
         "r2": float(r2),
         "best_max_depth": int(best_depth),
@@ -565,40 +726,45 @@ def train_one_file(csv_path: Path, args: argparse.Namespace) -> Dict[str, object
 
 def main() -> None:
     args = parse_args()
-    files = list_csv_files(args.data_dir)
-    if args.dataset:
-        files = [p for p in files if p.name == args.dataset]
-        if not files:
-            raise FileNotFoundError(f"Dataset not found in {args.data_dir}: {args.dataset}")
+    pairs = build_dataset_pairs(args.data_dir, args.dataset)
 
     args.result_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows: List[Dict[str, object]] = []
-    for path in files:
+    for dataset_stem, train_path, test_path in pairs:
         try:
-            row = train_one_file(path, args)
+            row = train_one_pair(train_path, test_path, dataset_stem, args)
         except Exception as exc:  # noqa: BLE001
             row = {
-                "file": path.name,
+                "file": f"{dataset_stem}.csv",
+                "train_file": train_path.name,
+                "test_file": test_path.name,
                 "rows_total": np.nan,
                 "rows_used_for_training": np.nan,
                 "rows_train": np.nan,
                 "rows_test": np.nan,
                 "mae": np.nan,
+                "mae_days": np.nan,
                 "rmse": np.nan,
                 "r2": np.nan,
                 "model_path": "",
                 "status": f"failed: {exc}",
             }
         all_rows.append(row)
-        print(f"{path.name}: {row['status']}")
+        print(f"{dataset_stem}: {row['status']}")
 
-    metrics_df = pd.DataFrame(all_rows)
+    new_metrics_df = pd.DataFrame(all_rows)
     report_path = args.result_dir / "decision_tree_metrics_all.csv"
+    if report_path.exists():
+        existing_metrics_df = pd.read_csv(report_path)
+        metrics_df = pd.concat([existing_metrics_df, new_metrics_df], ignore_index=True, sort=False)
+    else:
+        metrics_df = new_metrics_df
+
     metrics_df.to_csv(report_path, index=False)
 
-    trained_count = int((metrics_df["status"] == "trained").sum())
-    print(f"Trained models: {trained_count}/{len(files)}")
+    trained_count = int((new_metrics_df["status"] == "trained").sum())
+    print(f"Trained models this run: {trained_count}/{len(pairs)}")
     print(f"Saved aggregate metrics: {report_path}")
 
 

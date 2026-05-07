@@ -6,7 +6,6 @@ This script trains neural network models to predict the inter-event time (next_t
 for business process events based on:
   - Event context (activity, timestamp, numeric features)
     - Temporal patterns (prefix sequences with pooled embedding)
-    - Soft time-regime probabilities (predicted_time_regime_q1_pct/q2_pct/q3_pct)
 
 Key Features:
     - TorchMLP: Multi-layer perceptron with pooled prefix-sequence embedding
@@ -16,13 +15,11 @@ Key Features:
   - Early stopping: Based on validation loss with configurable patience
 
 Input: CSV files with columns [activity, timestamp, prefix_sequence,
-    time_span, predicted_time_regime_q1_pct, predicted_time_regime_q2_pct,
-    predicted_time_regime_q3_pct, next_time, ...]
-Note: Soft regime columns are required in both train and test inputs.
-Output: Trained models, predictions, and metrics to results/mlp/
+    time_span, next_time, ...]
+Output: Trained models, predictions, and metrics to results/mlp_no_time_regime/
 
 Usage:
-  python scripts/mlp.py --data-dir data_csv --train-file helpdesk_train.csv \\
+    python scripts/mlp_no_time_regime.py --data-dir data_csv --train-file helpdesk_train.csv \\
       --test-file helpdesk_test.csv --hidden-layers 512,256,128
 """
 
@@ -37,7 +34,6 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -47,7 +43,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 DEFAULT_DATA_DIR = Path("data_csv")
-DEFAULT_RESULT_DIR = Path("results/mlp")
+DEFAULT_RESULT_DIR = Path("results/mlp_no_time_regime")
 DEFAULT_EMBEDDING_DIM = 16
 SECONDS_PER_DAY = 86400.0
 TIME_UNIT_TO_SECONDS = {
@@ -56,21 +52,6 @@ TIME_UNIT_TO_SECONDS = {
     "hours": 3600.0,
     "days": 86400.0,
 }
-SOFT_REGIME_COLUMNS = [
-    "predicted_time_regime_q1_pct",
-    "predicted_time_regime_q2_pct",
-    "predicted_time_regime_q3_pct"
-]
-
-
-def apply_soft_regime_median_override(df: pd.DataFrame, reference_df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in SOFT_REGIME_COLUMNS:
-        if col not in out.columns or col not in reference_df.columns:
-            continue
-        median_value = pd.to_numeric(reference_df[col], errors="coerce").median()
-        out[col] = float(median_value) if pd.notna(median_value) else np.nan
-    return out
 
 
 class DenseBlock(nn.Module):
@@ -130,57 +111,6 @@ class TorchMLP(nn.Module):
             x = block(x)
 
         return self.output_layer(x).squeeze(-1)
-
-
-def print_model_architecture(model: nn.Module) -> None:
-    total_params = sum(parameter.numel() for parameter in model.parameters())
-    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-
-    print("Model architecture:")
-    print(model)
-    print("Parameter tensors:")
-    for name, parameter in model.named_parameters():
-        shape = tuple(parameter.shape)
-        status = "trainable" if parameter.requires_grad else "frozen"
-        print(f"  {name}: shape={shape}, numel={parameter.numel()}, {status}")
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-
-
-def export_model_to_onnx(
-    model: TorchMLP,
-    export_path: Path,
-    X_num_np: np.ndarray,
-    X_activity_np: np.ndarray,
-    X_prefix_np: np.ndarray,
-    X_prefix_len_np: np.ndarray,
-) -> None:
-    if len(X_num_np) == 0:
-        raise ValueError("Cannot export ONNX model without at least one example row")
-
-    device = next(model.parameters()).device
-    model.eval()
-    example_num = torch.as_tensor(X_num_np[:1], dtype=torch.float32, device=device)
-    example_activity = torch.as_tensor(X_activity_np[:1], dtype=torch.long, device=device)
-    example_prefix = torch.as_tensor(X_prefix_np[:1], dtype=torch.long, device=device)
-    example_prefix_len = torch.as_tensor(X_prefix_len_np[:1], dtype=torch.long, device=device)
-
-    export_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        model,
-        (example_num, example_activity, example_prefix, example_prefix_len),
-        export_path,
-        input_names=["numeric_x", "activity_x", "prefix_x", "prefix_len_x"],
-        output_names=["next_time_prediction"],
-        dynamic_axes={
-            "numeric_x": {0: "batch_size"},
-            "activity_x": {0: "batch_size"},
-            "prefix_x": {0: "batch_size", 1: "prefix_length"},
-            "prefix_len_x": {0: "batch_size"},
-            "next_time_prediction": {0: "batch_size"},
-        },
-        opset_version=17,
-    )
 
 
 def _stable_file_seed(base_seed: int, file_name: str) -> int:
@@ -245,14 +175,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Use only the first N temporal training cases (0 = use all training cases)",
     )
-    parser.add_argument(
-        "--max-iter",
-        "--epochs",
-        dest="max_iter",
-        type=int,
-        default=200,
-        help="Maximum training epochs / MLP iterations (default: 200)",
-    )
+    parser.add_argument("--max-iter", type=int, default=200, help="Maximum MLP iterations (default: 200)")
     parser.add_argument(
         "--hidden-layers",
         type=str,
@@ -276,11 +199,6 @@ def parse_args() -> argparse.Namespace:
         "--disable-sqrt-pred-clip",
         action="store_true",
         help="Disable sqrt-space prediction clipping before inverse transform",
-    )
-    parser.add_argument(
-        "--soft-regime-median-override",
-        action="store_true",
-        help="Replace all soft regime probability values with the training-column median for testing",
     )
     parser.add_argument("--val-size", type=float, default=0.2, help="Validation split from training slice (default: 0.1)")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
@@ -314,6 +232,12 @@ def parse_args() -> argparse.Namespace:
         action="store_const",
         const="weighted_mse",
         help="Use weighted MSE loss: log1p(next_time) * (pred-target)^2",
+    )
+    parser.add_argument(
+        "--weighted-alpha",
+        type=float,
+        default=0.5,
+        help="Deprecated compatibility flag; not used by --loss-weighted-mse",
     )
     parser.add_argument("--patience", type=int, default=6, help="Early stopping patience on validation loss (default: 6)")
     parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum validation-loss decrease to reset patience")
@@ -493,10 +417,6 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     out["time_span"] = pd.to_numeric(out["time_span"], errors="coerce")
     out["next_time"] = pd.to_numeric(out["next_time"], errors="coerce")
 
-    for col in SOFT_REGIME_COLUMNS:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-
     prefix_values = out["prefix_sequence"].apply(split_prefix_sequence)
     out["prefix_length"] = prefix_values.map(len).astype(float)
 
@@ -507,7 +427,6 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
         "ts_hour",
         "ts_month",
         "prefix_length",
-        *SOFT_REGIME_COLUMNS,
     ]
     for col in numeric_cols:
         out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -526,8 +445,7 @@ def get_categorical_columns() -> List[str]:
 
 
 def get_numeric_columns() -> List[str]:
-    base_cols = ["prefix_length", "time_span", "ts_dayofweek", "ts_hour", "ts_month"]
-    return [*base_cols, *SOFT_REGIME_COLUMNS]
+    return ["prefix_length", "time_span", "ts_dayofweek", "ts_hour", "ts_month"]
 
 
 def build_category_maps(df: pd.DataFrame, categorical_columns: List[str]) -> Dict[str, Dict[str, int]]:
@@ -640,44 +558,6 @@ def invert_sqrt_predictions(sqrt_predictions: np.ndarray, sqrt_clip_max: float) 
     return clipped ** 2
 
 
-def plot_learning_curve(history: Dict[str, List[float]], output_path: Path, title: str) -> None:
-    train_loss = history.get("train_loss", [])
-    val_loss = history.get("val_loss", [])
-    if not train_loss and not val_loss:
-        return
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    if train_loss:
-        ax.plot(np.arange(1, len(train_loss) + 1), train_loss, label="Train loss", linewidth=2.0)
-    if val_loss:
-        ax.plot(np.arange(1, len(val_loss) + 1), val_loss, label="Validation loss", linewidth=2.0)
-
-    best_series = val_loss if val_loss else train_loss
-    best_label = "Validation loss" if val_loss else "Train loss"
-    best_epoch = int(np.argmin(best_series) + 1)
-    best_loss = float(np.min(best_series))
-    ax.scatter([best_epoch], [best_loss], color="tab:red", s=45, zorder=3, label="Best epoch")
-    ax.annotate(
-        f"{best_label} best={best_loss:.4f}",
-        xy=(best_epoch, best_loss),
-        xytext=(8, 8),
-        textcoords="offset points",
-        fontsize=9,
-        color="tab:red",
-    )
-
-    ax.set_title(title)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
 def train_torch_model(
     X_train_num_np: np.ndarray,
     X_train_activity_np: np.ndarray,
@@ -689,12 +569,9 @@ def train_torch_model(
     X_val_prefix_np: np.ndarray,
     X_val_prefix_len_np: np.ndarray,
     y_val_np: np.ndarray,
-    y_train_seconds_np: np.ndarray,
-    y_val_seconds_np: np.ndarray,
     args: argparse.Namespace,
     activity_cardinality: int,
     prefix_cardinality: int,
-    sqrt_pred_clip_max: float,
     train_seed: int,
 ) -> Tuple[TorchMLP, Dict[str, List[float]], int, bool]:
     set_global_seed(train_seed)
@@ -707,7 +584,6 @@ def train_torch_model(
         hidden_layers=hidden_layers,
         embedding_dim=args.embedding_dim,
     ).to(device)
-    print_model_architecture(model)
 
     if args.loss_name == "mse":
         criterion = nn.MSELoss()
@@ -749,14 +625,8 @@ def train_torch_model(
     X_val_prefix_t = torch.as_tensor(X_val_prefix_np, dtype=torch.long, device=device) if len(X_val_prefix_np) > 0 else None
     X_val_prefix_len_t = torch.as_tensor(X_val_prefix_len_np, dtype=torch.long, device=device) if len(X_val_prefix_len_np) > 0 else None
     y_val_t = to_float_tensor(y_val_np, device) if len(y_val_np) > 0 else None
-    y_train_seconds_np = np.asarray(y_train_seconds_np, dtype=float)
-    y_val_seconds_np = np.asarray(y_val_seconds_np, dtype=float)
-    X_train_num_t = to_float_tensor(X_train_num_np, device)
-    X_train_activity_t = torch.as_tensor(X_train_activity_np, dtype=torch.long, device=device)
-    X_train_prefix_t = torch.as_tensor(X_train_prefix_np, dtype=torch.long, device=device)
-    X_train_prefix_len_t = torch.as_tensor(X_train_prefix_len_np, dtype=torch.long, device=device)
 
-    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_mae_days": [], "val_mae_days": []}
+    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": []}
     best_state = deepcopy(model.state_dict())
     best_val = float("inf")
     best_epoch = 1
@@ -797,35 +667,6 @@ def train_torch_model(
             val_loss = float(train_loss)
 
         history["val_loss"].append(float(val_loss))
-
-        model.eval()
-        with torch.no_grad():
-            train_pred = model(X_train_num_t, X_train_activity_t, X_train_prefix_t, X_train_prefix_len_t)
-            train_pred_days = invert_sqrt_predictions(train_pred.detach().cpu().numpy(), sqrt_pred_clip_max)
-            train_mae_days = float(mean_absolute_error(y_train_seconds_np, train_pred_days) / SECONDS_PER_DAY)
-
-            if (
-                X_val_num_t is not None
-                and X_val_activity_t is not None
-                and X_val_prefix_t is not None
-                and X_val_prefix_len_t is not None
-                and y_val_t is not None
-                and len(X_val_num_np) > 0
-                and len(y_val_seconds_np) > 0
-            ):
-                val_pred_days = invert_sqrt_predictions(
-                    model(X_val_num_t, X_val_activity_t, X_val_prefix_t, X_val_prefix_len_t)
-                    .detach()
-                    .cpu()
-                    .numpy(),
-                    sqrt_pred_clip_max,
-                )
-                val_mae_days = float(mean_absolute_error(y_val_seconds_np, val_pred_days) / SECONDS_PER_DAY)
-            else:
-                val_mae_days = float(train_mae_days)
-
-        history["train_mae_days"].append(float(train_mae_days))
-        history["val_mae_days"].append(float(val_mae_days))
 
         if val_loss < best_val - args.min_delta:
             best_val = val_loss
@@ -877,17 +718,6 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
     raw_train_data = load_single_dataset(train_csv_path, args.max_rows_per_file)
     raw_test_data = load_single_dataset(test_csv_path, args.max_rows_per_file)
 
-    regime_feature_mode = "soft_probabilities"
-    regime_feature_columns = ",".join(SOFT_REGIME_COLUMNS)
-
-    missing_soft = [
-        col
-        for col in SOFT_REGIME_COLUMNS
-        if col not in raw_train_data.columns or col not in raw_test_data.columns
-    ]
-    if missing_soft:
-        raise ValueError(f"Missing required soft time-regime columns: {missing_soft}")
-
     _, target_col = validate_required_columns(raw_train_data)
     validate_required_columns(raw_test_data)
     dataset_time_unit = detect_time_unit(raw_train_data)
@@ -897,9 +727,6 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
 
     train_data = coerce_types(raw_train_data)
     test_data = coerce_types(raw_test_data)
-    if args.soft_regime_median_override:
-        train_data = apply_soft_regime_median_override(train_data, train_data)
-        test_data = apply_soft_regime_median_override(test_data, train_data)
     train_data["__row_id"] = train_data.index
     test_data["__row_id"] = test_data.index
 
@@ -1025,29 +852,11 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
         X_val_prefix_np,
         X_val_prefix_len_np,
         y_val_sqrt,
-        train_fit_part[target_col].to_numpy(dtype=float),
-        val_fit_part[target_col].to_numpy(dtype=float) if not val_fit_part.empty else np.array([], dtype=float),
         args,
         activity_cardinality,
         prefix_cardinality,
-        sqrt_pred_clip_max,
         file_seed,
     )
-
-    plots_dir = args.result_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    learning_curve_path = plots_dir / f"{dataset_stem}_learning_curve.png"
-    plot_learning_curve(history, learning_curve_path, f"Learning Curve: {dataset_stem}")
-
-    learning_curve_csv_path = plots_dir / f"{dataset_stem}_learning_curve.csv"
-    history_df = pd.DataFrame({
-        "epoch": np.arange(1, len(history["train_loss"]) + 1),
-        "train_loss": history["train_loss"],
-        "val_loss": history["val_loss"],
-        "train_mae_days": history.get("train_mae_days", [np.nan] * len(history["train_loss"])),
-        "val_mae_days": history.get("val_mae_days", [np.nan] * len(history["train_loss"])),
-    })
-    history_df.to_csv(learning_curve_csv_path, index=False)
 
     y_pred_test = invert_sqrt_predictions(
         predict_torch_embeddings(
@@ -1147,20 +956,6 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
     }
     torch.save(checkpoint, model_path)
 
-    onnx_path = models_dir / f"{dataset_stem}_mlp_next_time.onnx"
-    try:
-        export_model_to_onnx(
-            model,
-            onnx_path,
-            X_fit_num_np,
-            X_fit_activity_np,
-            X_fit_prefix_np,
-            X_fit_prefix_len_np,
-        )
-        print(f"Saved ONNX model: {onnx_path}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARNING: failed to export ONNX model for {dataset_stem}: {exc}")
-
     predictions_dir = args.result_dir / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = predictions_dir / f"{dataset_stem}_prediction.csv"
@@ -1177,27 +972,23 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
         "max_train_cases": int(args.max_train_cases),
         "train_cases_used": int(train_part["case_index"].nunique()) if "case_index" in train_part.columns else np.nan,
         "target_transform": "sqrt",
-        "time_regime_feature_mode": regime_feature_mode,
-        "time_regime_feature_columns": regime_feature_columns,
+        "time_regime_feature_mode": "none",
+        "time_regime_feature_columns": "",
         "time_unit": str(dataset_time_unit),
         "time_unit_seconds": float(dataset_unit_seconds),
         "time_rounding_seconds": float(args.time_rounding_seconds),
         "loss_name": str(args.loss_name),
+        "weighted_alpha": float(args.weighted_alpha),
         "train_epochs": int(len(history["train_loss"])),
         "best_epoch": int(best_epoch),
         "stopped_early": bool(stopped_early),
         "train_loss_last": float(history["train_loss"][-1]) if history["train_loss"] else np.nan,
         "val_loss_last": float(history["val_loss"][-1]) if history["val_loss"] else np.nan,
-        "train_mae_days_last": float(history["train_mae_days"][-1]) if history["train_mae_days"] else np.nan,
-        "val_mae_days_last": float(history["val_mae_days"][-1]) if history["val_mae_days"] else np.nan,
         "mae": float(mae),
         "mae_days": float(mae_days),
         "rmse": float(rmse),
         "r2": float(r2),
         "model_path": str(model_path),
-        "onnx_path": str(onnx_path),
-        "learning_curve_path": str(learning_curve_path),
-        "learning_curve_csv_path": str(learning_curve_csv_path),
         "prediction_path": str(prediction_path),
         "status": "trained",
     }

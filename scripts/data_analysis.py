@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Run PM4Py-based process mining analysis on XES files in a data directory."""
+"""Analyze XES event logs with PM4Py.
+
+For each .xes file in the input data directory, this script loads the event log,
+builds a directly-follows graph from the most frequent activities, computes
+summary statistics for traces grouped by their last activity, and writes CSV
+reports plus PDF plots to the output directory.
+
+Input selection:
+    Folder-based only via --data-dir. This script processes all .xes files in
+    the folder and does not provide a single-file filter flag.
+
+Example:
+    python scripts/data_analysis.py --data-dir data --output-dir results/data_analysis
+
+Usage:
+    --data-dir PATH        Directory containing .xes files (default: data)
+    --output-dir PATH      Directory for CSV/PDF outputs (default: results/data_analysis)
+    --top-activities N     Keep the top N activities in the DFG plot (default: 20)
+    --time-unit UNIT       seconds, minutes, hours, or days (default: hours)
+"""
 
 from __future__ import annotations
 

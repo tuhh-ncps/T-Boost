@@ -9,6 +9,19 @@ Expected columns in input CSV:
 - case_index
 - actual_next_time
 - prediction_next_time
+
+Input selection:
+    File-based via --input. Provide one prediction CSV path directly.
+
+Example:
+    python scripts/decision_tree_plot.py --input results/decision_tree/predictions/BPI12_prediction.csv
+
+Usage:
+    --input PATH          Prediction CSV to plot
+    --output PATH         Output PNG file path
+    --metrics-output PATH Output CSV with MAE summary metrics
+    --rolling-window N    Rolling mean window used for smoothing
+    --per-resource        Also generate one plot per resource value
 """
 
 from __future__ import annotations

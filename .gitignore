@@ -17,6 +17,7 @@ wheels/
 *.log
 *.ckpt
 data/
+data_csv/
 archieve/
 
 # results

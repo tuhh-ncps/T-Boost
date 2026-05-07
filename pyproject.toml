@@ -1,0 +1,16 @@
+[project]
+name = "federated-learning"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flwr-datasets>=0.6.0",
+    "flwr[simulation]>=1.28.0",
+    "neutron>=28.0.0",
+    "onnxscript>=0.7.0",
+    "pandas>=3.0.2",
+    "pm4py>=2.7.22",
+    "scikit-learn>=1.8.0",
+    "torch>=2.11.0",
+]
