@@ -1,4 +1,4 @@
-# T-Boost: Temporal Boosting
+# T-Boost: Temporal Boosting for Next Event Time Prediction
 
 Utilities for process-mining experiments on event logs. The scripts in `scripts/` cover preprocessing, exploratory analysis, model training, evaluation, and plotting.
 
