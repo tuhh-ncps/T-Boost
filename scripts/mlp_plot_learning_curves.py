@@ -127,6 +127,22 @@ def plot_learning_curves(
             epochs = pd.to_numeric(df["epoch"], errors="coerce").to_numpy()
             plotted_any_metric = False
 
+            # Determine best epoch for this dataset: prefer `val_loss` if present,
+            # otherwise fall back to `train_loss`. We'll truncate plotted series
+            # at the best epoch so curves stop where training selected the best model.
+            best_epoch = None
+            for cand in ("val_loss", "train_loss"):
+                if cand in df.columns:
+                    cand_series = pd.to_numeric(df[cand], errors="coerce").to_numpy()
+                    if np.any(~np.isnan(cand_series)):
+                        # numpy.nanargmin ignores NaNs
+                        try:
+                            idx = int(np.nanargmin(cand_series))
+                            best_epoch = int(idx + 1)
+                        except ValueError:
+                            best_epoch = None
+                        break
+
             for idx, metric in enumerate(metrics):
                 if metric not in df.columns:
                     print(f"Skip {dataset_name}: column '{metric}' not found")
@@ -140,6 +156,14 @@ def plot_learning_curves(
 
                 epochs_valid = epochs[valid_mask]
                 values_valid = values[valid_mask]
+                # If a best epoch was found, trim plotted points at that epoch.
+                if best_epoch is not None:
+                    trim_mask = epochs_valid <= best_epoch
+                    if not np.any(trim_mask):
+                        print(f"Skip {dataset_name}: no {metric} values before best_epoch={best_epoch}")
+                        continue
+                    epochs_valid = epochs_valid[trim_mask]
+                    values_valid = values_valid[trim_mask]
                 label = f"{dataset_name} - {metric}"
                 ax.plot(
                     epochs_valid,
@@ -159,16 +183,16 @@ def plot_learning_curves(
             print(f"Error loading {csv_file}: {exc}")
             continue
 
-    ax.set_title(title, fontsize=14, fontweight="bold")
+    # Title removed per user request.
     ax.set_xlabel("Epoch", fontsize=12)
     if len(metrics) == 1:
         ax.set_ylabel(metrics[0].replace("_", " ").title(), fontsize=12)
     else:
         ax.set_ylabel("Metric Value", fontsize=12)
     ax.grid(alpha=0.3)
-    ax.legend(loc="upper right", fontsize=10)
+    ax.legend(loc="upper right", fontsize=12)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=200, bbox_inches="tight", format="pdf")
     plt.close(fig)
     print(f"Saved combined learning curve plot: {output_path}")
 

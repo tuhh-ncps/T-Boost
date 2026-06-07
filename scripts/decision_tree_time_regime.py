@@ -20,6 +20,8 @@ Requested feature set:
 - prefix_length
 - log_prefix_dt_last
 - log_time_span
+- transition_time_mean
+- transition_time_std
 
 Target label:
 - time_regime
@@ -61,10 +63,10 @@ DEFAULT_DATA_DIR = Path("data_csv")
 DEFAULT_RESULT_DIR = Path("results/decision_tree_time_regime")
 DEFAULT_PRECEDING_K = 3
 
-VALID_REGIMES = {"q1", "q2", "q3", "q4"}
-TIME_REGIME_TO_INT = {"q1": 0, "q2": 1, "q3": 2, "q4": 3}
+VALID_REGIMES = {"q1", "q2", "q3"}
+TIME_REGIME_TO_INT = {"q1": 0, "q2": 1, "q3": 2}
 INT_TO_TIME_REGIME = {v: k for k, v in TIME_REGIME_TO_INT.items()}
-TIME_REGIME_CLASSES = ["q1", "q2", "q3", "q4"]
+TIME_REGIME_CLASSES = ["q1", "q2", "q3"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,12 +310,20 @@ def compute_log_regime_bins(series: pd.Series) -> np.ndarray:
     valid = np.isfinite(values) & (values > 0.0)
 
     if valid.sum() == 0:
-         return np.array([], dtype=float)
+        return np.array([], dtype=float)
 
     log_values = np.log(values[valid])
+    q=4
     # y = qcut(log(next_time)) with duplicate-edge protection.
-    _, raw_bins = pd.qcut(log_values, q=4, retbins=True, duplicates="drop")
+    _, raw_bins = pd.qcut(log_values, q=q, retbins=True, duplicates="drop")
     edges = np.unique(np.concatenate(([-np.inf], raw_bins[1:-1], [np.inf])))
+
+    actual_bins = len(edges) - 1
+
+    print("requested q =", q)
+    print("actual bins =", actual_bins)
+    print("edges =", edges)
+
     return edges
 
 
@@ -462,6 +472,29 @@ def add_transition_long_term_ratio_feature(
     return out, edges
 
 
+def add_transition_stats_from_train(
+    train_df: pd.DataFrame,
+    target_df: pd.DataFrame,
+    time_col: str,
+) -> pd.DataFrame:
+    transition_target = pd.to_numeric(train_df[time_col], errors="coerce")
+    transition_stats = (
+        pd.DataFrame({"transition": train_df["transition"], "next_time_target": transition_target})
+        .dropna(subset=["transition", "next_time_target"])
+        .groupby("transition", dropna=False)["next_time_target"]
+        .agg(["mean", "std"])
+        .rename(columns={"mean": "transition_time_mean", "std": "transition_time_std"})
+    )
+
+    global_mean = float(transition_target.dropna().mean()) if transition_target.notna().any() else 0.0
+    global_std = float(transition_target.dropna().std()) if transition_target.notna().any() else 0.0
+
+    out = target_df.join(transition_stats, on="transition")
+    out["transition_time_mean"] = pd.to_numeric(out["transition_time_mean"], errors="coerce").fillna(global_mean)
+    out["transition_time_std"] = pd.to_numeric(out["transition_time_std"], errors="coerce").fillna(global_std)
+    return out
+
+
 def coerce_types(df: pd.DataFrame, preceding_k: int) -> pd.DataFrame:
     out = df.copy()
 
@@ -572,8 +605,8 @@ def get_model_feature_columns(preceding_k: int) -> List[str]:
             "long_term_ratio",
             "log_prefix_dt_last",
             "log_time_span",
-            # "transition_time_mean",  # commented out: do not use as model feature
-            # "transition_time_std",   # commented out: do not use as model feature
+            "transition_time_mean",
+            "transition_time_std",
         ]
     )
     return cols
@@ -649,7 +682,7 @@ def build_model_pipeline(
     _ = (preceding_k, class_weight, min_samples_leaf)
     model = LGBMClassifier(
         objective="multiclass",
-        num_class=4,
+        num_class=3,
         n_estimators=n_estimators,
         learning_rate=learning_rate,
         num_leaves=num_leaves,
@@ -671,7 +704,6 @@ def generate_oof_probs(
     preceding_k: int,
     class_weight: str,
     n_splits: int = 3,
-    case_ids: pd.Series | None = None,
 ) -> pd.DataFrame:
     oof_probs = pd.DataFrame(
         0.0,
@@ -679,37 +711,16 @@ def generate_oof_probs(
         columns=[f"predicted_time_regime_{r}_pct" for r in TIME_REGIME_CLASSES],
     )
 
-    if case_ids is None:
-        raise ValueError("case_ids must be provided for case-stratified OOF splitting.")
+    if len(X) <= n_splits:
+        raise ValueError("Not enough samples for TimeSeriesSplit OOF prediction.")
 
-    # Build an ordered list of unique cases by their first occurrence in X. We
-    # then apply TimeSeriesSplit over the ordered cases so that training folds
-    # never contain cases that start after validation cases (no future-case leakage).
-    case_series = case_ids.loc[X.index]
-    # earliest row index per case indicates the case start ordering
-    group_starts = case_series.groupby(case_series).apply(lambda s: s.index.min())
-    ordered_cases = group_starts.sort_values().index.to_numpy()
-
-    num_cases = len(ordered_cases)
-    if num_cases <= n_splits:
-        raise ValueError("Not enough unique cases for ordered TimeSeriesSplit OOF prediction.")
-
-    tss = TimeSeriesSplit(n_splits=n_splits)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
     categorical_features = get_categorical_feature_columns(preceding_k)
 
-    for train_case_idx, val_case_idx in tss.split(ordered_cases):
-        train_cases = ordered_cases[train_case_idx]
-        val_cases = ordered_cases[val_case_idx]
-
-        train_pos = np.flatnonzero(case_series.isin(train_cases))
-        val_pos = np.flatnonzero(case_series.isin(val_cases))
-
-        if train_pos.size == 0 or val_pos.size == 0:
-            continue
-
-        X_train_fold = X.iloc[train_pos]
-        y_train_fold = y.iloc[train_pos]
-        X_val_fold = X.iloc[val_pos]
+    for train_idx, val_idx in tscv.split(X):
+        X_train_fold = X.iloc[train_idx]
+        y_train_fold = y.iloc[train_idx]
+        X_val_fold = X.iloc[val_idx]
 
         X_train_prepared, numeric_medians_fold, categorical_levels_fold = prepare_lgbm_features(
             X_train_fold,
@@ -730,7 +741,7 @@ def generate_oof_probs(
 
         model.fit(X_train_prepared, y_train_fold, **fit_kwargs)
 
-        val_index = X.index[val_pos]
+        val_index = X.index[val_idx]
         oof_probs.loc[val_index, :] = map_time_regime_probabilities(model, X_val_prepared).to_numpy()
 
     return oof_probs
@@ -876,6 +887,10 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
         train_data["time_regime"] = assign_time_regime_from_edges(train_data[time_col], log_bin_edges)
         test_data["time_regime"] = assign_time_regime_from_edges(test_data[time_col], log_bin_edges)
 
+    # Train-only transition statistics, merged into both train and test features.
+    train_data = add_transition_stats_from_train(train_data, train_data, time_col=time_col)
+    test_data = add_transition_stats_from_train(train_data, test_data, time_col=time_col)
+
     # Train-derived qcut bins over log_delta_t_1, then transition + bin combination.
     train_data, dt1_edges = add_transition_dt1_feature(train_data, train_data, q=10)
     test_data, _ = add_transition_dt1_feature(train_data, test_data, q=10)
@@ -884,6 +899,8 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
 
     train_data["__row_id"] = train_data.index
     test_data["__row_id"] = test_data.index
+    train_time_regime_by_row_id = train_data.set_index("__row_id")["time_regime"]
+    test_time_regime_by_row_id = test_data.set_index("__row_id")["time_regime"]
 
     train_df = train_data.dropna(subset=[target_col]).copy()
     test_df = test_data.dropna(subset=[target_col]).copy()
@@ -999,12 +1016,6 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
         preceding_k=args.preceding_k,
         class_weight=args.class_weight,
         n_splits=3,
-        case_ids=train_df.index.to_series() if 'case_id' not in train_df.columns else train_df['case_id'],
-    )
-    y_actual_train_series = pd.Series(
-        map_int_to_time_regime(y_train.to_numpy(dtype=int)),
-        index=X_train.index,
-        name="actual_time_regime",
     )
 
     sample_weight_full = build_sample_weights(y_train, args.class_weight)
@@ -1015,33 +1026,14 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
     y_pred_train_raw = final_pipeline.predict(X_train_prepared)
     y_pred_test_raw = final_pipeline.predict(X_test_prepared)
     y_proba_test_pct = map_time_regime_probabilities(final_pipeline, X_test_prepared)
-    y_conf_train = y_proba_train_pct.max(axis=1).rename("prediction_confidence")
-    y_conf_test = y_proba_test_pct.max(axis=1).rename("prediction_confidence")
-    y_pred_train_series = pd.Series(
-        map_int_to_time_regime(np.asarray(y_pred_train_raw, dtype=int)),
-        index=X_train.index,
-        name="prediction_time_regime",
-    )
-
-    # Drop any training rows that did not receive an OOF prediction. Filling
-    # them with final-model outputs would leak target information; dropping is
-    # safer for stacking. We keep the final model trained on all data but only
-    # export rows that had genuine OOF probabilities.
-    zero_mask = (y_proba_train_pct.sum(axis=1) == 0)
-    if zero_mask.any():
-        keep_index = y_proba_train_pct.index[~zero_mask]
-        train_df = train_df.loc[keep_index].copy()
-        y_proba_train_pct = y_proba_train_pct.loc[keep_index].copy()
     y_test_values = y_test.to_numpy(dtype=int)
     accuracy = float(accuracy_score(y_test_values, y_pred_test_raw))
     f1_macro = float(f1_score(y_test_values, y_pred_test_raw, average="macro"))
 
     train_df = train_df.copy()
     test_df = test_df.copy()
-    train_df["prediction_time_regime"] = y_pred_train_series.loc[train_df.index].to_numpy()
+    train_df["prediction_time_regime"] = map_int_to_time_regime(np.asarray(y_pred_train_raw, dtype=int))
     test_df["prediction_time_regime"] = map_int_to_time_regime(np.asarray(y_pred_test_raw, dtype=int))
-    train_df["prediction_confidence"] = y_conf_train.loc[train_df.index].to_numpy()
-    test_df["prediction_confidence"] = y_conf_test.to_numpy()
     train_df = pd.concat([train_df, y_proba_train_pct], axis=1)
     test_df = pd.concat([test_df, y_proba_test_pct], axis=1)
 
@@ -1053,24 +1045,23 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
     raw_test_with_row_id["__row_id"] = raw_test_with_row_id.index
 
     train_export = raw_train_with_row_id.merge(
-        train_df[["__row_id", "prediction_time_regime", "prediction_confidence", *y_proba_train_pct.columns]],
+        train_df[["__row_id", "prediction_time_regime", *y_proba_train_pct.columns]],
         on="__row_id",
         how="inner",
     )
-    train_export["actual_time_regime"] = y_actual_train_series.loc[train_export["__row_id"]].to_numpy()
+    train_export["actual_time_regime"] = map_int_to_time_regime(y_train.to_numpy(dtype=int))
     train_export["prediction_time_regime"] = train_export["prediction_time_regime"].astype(str)
     train_export = train_export[
         train_input_cols
         + [
             "actual_time_regime",
             "prediction_time_regime",
-            "prediction_confidence",
             *y_proba_train_pct.columns,
         ]
     ]
 
     prediction_export = raw_test_with_row_id.merge(
-        test_df[["__row_id", "prediction_time_regime", "prediction_confidence", *y_proba_test_pct.columns]],
+        test_df[["__row_id", "prediction_time_regime", *y_proba_test_pct.columns]],
         on="__row_id",
         how="inner",
     )
@@ -1081,24 +1072,31 @@ def train_one_pair(train_csv_path: Path, test_csv_path: Path, dataset_stem: str,
         + [
             "actual_time_regime",
             "prediction_time_regime",
-            "prediction_confidence",
             *y_proba_test_pct.columns,
         ]
     ]
 
     train_with_regime_export = raw_train_with_row_id.merge(
-        train_df[["__row_id", "prediction_time_regime", "prediction_confidence", *y_proba_train_pct.columns]],
+        train_df[["__row_id", "prediction_time_regime", *y_proba_train_pct.columns]],
         on="__row_id",
         how="left",
     )
+    # Replace the original raw time_regime with the reassigned values used by this run.
+    train_with_regime_export["time_regime"] = train_time_regime_by_row_id.reindex(
+        train_with_regime_export["__row_id"]
+    ).to_numpy()
     train_with_regime_export = train_with_regime_export.drop(columns=["__row_id"])
     train_with_regime_export = train_with_regime_export.rename(columns={"prediction_time_regime": "predicted_time_regime"})
 
     test_with_regime_export = raw_test_with_row_id.merge(
-        test_df[["__row_id", "prediction_time_regime", "prediction_confidence", *y_proba_test_pct.columns]],
+        test_df[["__row_id", "prediction_time_regime", *y_proba_test_pct.columns]],
         on="__row_id",
         how="left",
     )
+    # Replace the original raw time_regime with the reassigned values used by this run.
+    test_with_regime_export["time_regime"] = test_time_regime_by_row_id.reindex(
+        test_with_regime_export["__row_id"]
+    ).to_numpy()
     test_with_regime_export = test_with_regime_export.drop(columns=["__row_id"])
     test_with_regime_export = test_with_regime_export.rename(columns={"prediction_time_regime": "predicted_time_regime"})
 

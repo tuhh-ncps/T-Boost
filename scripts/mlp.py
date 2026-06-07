@@ -256,7 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hidden-layers",
         type=str,
-        default="512,256,128",
+        default="128,128",
         help="Comma-separated hidden layer sizes (default: 512,256,128)",
     )
     parser.add_argument("--embedding-dim", type=int, default=DEFAULT_EMBEDDING_DIM, help="Embedding size for categorical features (default: 12)")
