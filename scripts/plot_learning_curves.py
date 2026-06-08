@@ -95,6 +95,27 @@ def extract_dataset_name(csv_path: Path) -> str:
     if stem.endswith("_learning_curve"):
         return stem[: -len("_learning_curve")]
     return stem
+# Optional mapping from extracted dataset name -> display title used in legends
+# Edit this to customize displayed dataset names (e.g. map 'bpi_12_w' -> 'BPI12 (W)')
+FILE_TITLE_MAP: dict[str, str] = {
+    "BPI12": "BPI12",
+    "BPI13": "BPI13",
+    "bpi_12_w": "BPI12 (W)",
+    "helpdesk": "Helpdesk16",
+    "helpdesk17": "Helpdesk17",
+}
+
+
+def _format_metric_label(metric: str) -> str:
+    if metric == "train_loss":
+        return "train loss"
+    if metric == "val_loss":
+        return "val. loss"
+    if metric == "train_mae_days":
+        return "train MAE (days)"
+    if metric == "val_mae_days":
+        return "val. MAE (days)"
+    return metric.replace("_", " ")
 
 
 def plot_learning_curves(
@@ -109,7 +130,7 @@ def plot_learning_curves(
     fig, ax = plt.subplots(figsize=figsize)
 
     # Use a colormap with enough distinct colors
-    cmap = plt.cm.get_cmap("tab20")
+    cmap = plt.get_cmap("tab20")
     num_files = len(csv_files)
     colors = [cmap(i % 20) for i in range(num_files)]
     line_styles = {
@@ -121,6 +142,7 @@ def plot_learning_curves(
 
     for csv_file, color in zip(csv_files, colors):
         dataset_name = extract_dataset_name(csv_file)
+        display_name = FILE_TITLE_MAP.get(dataset_name, FILE_TITLE_MAP.get(dataset_name.lower(), dataset_name))
         try:
             df = pd.read_csv(csv_file, low_memory=False)
 
@@ -164,7 +186,7 @@ def plot_learning_curves(
                         continue
                     epochs_valid = epochs_valid[trim_mask]
                     values_valid = values_valid[trim_mask]
-                label = f"{dataset_name} - {metric}"
+                label = f"{display_name} { _format_metric_label(metric) }"
                 ax.plot(
                     epochs_valid,
                     values_valid,

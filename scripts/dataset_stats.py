@@ -52,6 +52,14 @@ TIMESTAMP_CANDIDATES = [
     "event_time",
 ]
 
+NEXT_TIME_CANDIDATES = [
+    "next_time_seconds",
+    "next_time",
+    "time_to_next",
+    "next_interval",
+    "next_time_s",
+]
+
 
 def detect_column(columns, candidates):
     cols_lower = {c.lower(): c for c in columns}
@@ -108,9 +116,29 @@ def stats_for_file(path: Path) -> dict | None:
     time_spans = time_spans.fillna(0.0)
 
     median_case_length = float(np.median(case_counts))
-    median_timespan_days = float(np.median(time_spans) / 86400.0)
-    max_timespan_days = float(time_spans.max() / 86400.0)
+    std_case_length = float(np.std(case_counts, ddof=0))
+    # By default compute per-case timespan metrics (in seconds/days)
+    # Compute per-case timespan metrics in seconds
+    median_timespan_seconds = float(np.median(time_spans))
+    max_timespan_seconds = float(time_spans.max())
     min_timespan_seconds = float(time_spans.min())
+
+    # If a next-time column exists (prefer next_time_seconds), compute metrics on it
+    next_col = detect_column(list(df.columns), NEXT_TIME_CANDIDATES)
+    median_next_time_seconds = None
+    max_next_time_seconds = None
+    min_next_time_seconds = None
+    std_next_time_seconds = None
+    if next_col is not None:
+        next_vals = pd.to_numeric(df[next_col], errors="coerce")
+        # ignore NaNs
+        if next_vals.dropna().size > 0:
+            next_clean = next_vals.dropna()
+            # next_time values are expected in seconds (prefer next_time_seconds)
+            median_next_time_seconds = float(np.nanmedian(next_clean))
+            max_next_time_seconds = float(np.nanmax(next_clean))
+            min_next_time_seconds = float(np.nanmin(next_clean))
+            std_next_time_seconds = float(np.nanstd(next_clean, ddof=0))
 
     return {
         "file": str(path),
@@ -118,9 +146,14 @@ def stats_for_file(path: Path) -> dict | None:
         "events": total_events,
         "activities": total_activities,
         "median_case_length": median_case_length,
-        "median_timespan_days": median_timespan_days,
-        "max_timespan_days": max_timespan_days,
+        "std_case_length": std_case_length,
+        "median_timespan_seconds": median_timespan_seconds,
+        "max_timespan_seconds": max_timespan_seconds,
         "min_timespan_seconds": min_timespan_seconds,
+        "median_next_time_seconds": median_next_time_seconds,
+        "max_next_time_seconds": max_next_time_seconds,
+        "min_next_time_seconds": min_next_time_seconds,
+        "std_next_time_seconds": std_next_time_seconds,
         "bad_timestamps": int(n_nat),
     }
 
@@ -179,9 +212,18 @@ def main(argv: list[str] | None = None) -> int:
         lines.append(f"- Events: {res['events']}")
         lines.append(f"- Activities: {res['activities']}")
         lines.append(f"- Median case length (events): {res['median_case_length']:.2f}")
-        lines.append(f"- Median timespan (days): {res['median_timespan_days']:.3f}")
-        lines.append(f"- Max timespan (days): {res['max_timespan_days']:.3f}")
+        if 'std_case_length' in res:
+            lines.append(f"- Std case length (events): {res['std_case_length']:.2f}")
+        lines.append(f"- Median timespan (seconds): {res['median_timespan_seconds']:.1f}")
+        lines.append(f"- Max timespan (seconds): {res['max_timespan_seconds']:.1f}")
         lines.append(f"- Min timespan (seconds): {res['min_timespan_seconds']:.1f}")
+        # report next_time metrics separately when present
+        if res.get('median_next_time_seconds') is not None:
+            lines.append(f"- Median next_time (seconds): {res['median_next_time_seconds']:.1f}")
+            lines.append(f"- Max next_time (seconds): {res.get('max_next_time_seconds'):.1f}")
+            lines.append(f"- Min next_time (seconds): {res.get('min_next_time_seconds'):.1f}")
+        if res.get('std_next_time_seconds') is not None:
+            lines.append(f"- Std next_time (seconds): {res['std_next_time_seconds']:.2f}")
         lines.append(f"- Rows with invalid timestamps: {res.get('bad_timestamps',0)}")
         lines.append("")
 

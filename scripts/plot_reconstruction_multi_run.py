@@ -26,6 +26,22 @@ datasets = [
 
 all_losses = {}
 
+# Optional mapping from CSV filename or stem -> display title used in plot legends.
+# Edit this mapping to customize how datasets are named on the combined figure.
+FILE_TITLE_MAP: dict[str, str] = {
+    "BPI12_train.csv": "BPI12",
+    "bpi_12_w_train.csv": "BPI12 (W)",
+    "helpdesk_train.csv": "Helpdesk16",
+    "helpdesk17_train.csv": "Helpdesk17",
+    "BPI13_train.csv": "BPI13",
+    "BPI17_train.csv": "BPI17",
+    "BPI20DD_train.csv": "BPI20 DD",
+    "BPI20ID_train.csv": "BPI20 ID",
+    "BPI20TC_train.csv": "BPI20 TC",
+    "BPI20RP_train.csv": "BPI20 RP",
+    "BPI20PD_train.csv": "BPI20 PD",
+}
+
 for name in datasets:
     path = DATA_DIR / name
     if not path.exists():
@@ -59,17 +75,18 @@ for name in datasets:
             losses.append(float(loss))
         except Exception:
             losses.append(np.nan)
-    all_losses[name] = np.array(losses)
+    display_name = FILE_TITLE_MAP.get(name, FILE_TITLE_MAP.get(Path(name).stem, name))
+    all_losses[display_name] = np.array(losses)
 
 # Plot combined
 fig, ax = plt.subplots(figsize=(7, 5))
 for label, loss_arr in all_losses.items():
     ax.plot(candidate_ks, loss_arr, marker='o', label=label)
-ax.axvline(4, linestyle=':', color='black', linewidth=1.5, label='Temporal regimes K=4')
-ax.set_xlabel('Number of temporal regimes (K)')
-ax.set_ylabel('Reconstruction Loss L(K)')
+ax.axvline(4, linestyle=':', color='black', linewidth=1.5, label='Temporal scales R=4')
+ax.set_xlabel('Number of temporal scales (R)')
+ax.set_ylabel('Reconstruction Loss L(R)')
 ax.grid(True, alpha=0.25)
-ax.legend(loc='best', fontsize=12)
+ax.legend(loc='best', fontsize=11)
 out = OUT_DIR / 'quantile_analysis_reconstruction_multi.pdf'
 fig.tight_layout()
 fig.savefig(out, dpi=200, bbox_inches='tight')

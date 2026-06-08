@@ -63,10 +63,10 @@ DEFAULT_DATA_DIR = Path("data_csv")
 DEFAULT_RESULT_DIR = Path("results/decision_tree_time_regime")
 DEFAULT_PRECEDING_K = 3
 
-VALID_REGIMES = {"q1", "q2", "q3"}
-TIME_REGIME_TO_INT = {"q1": 0, "q2": 1, "q3": 2}
+VALID_REGIMES = {"q1", "q2", "q3", "q4"}
+TIME_REGIME_TO_INT = {"q1": 0, "q2": 1, "q3": 2, "q4": 3}
 INT_TO_TIME_REGIME = {v: k for k, v in TIME_REGIME_TO_INT.items()}
-TIME_REGIME_CLASSES = ["q1", "q2", "q3"]
+TIME_REGIME_CLASSES = ["q1", "q2", "q3", "q4"]
 
 
 def parse_args() -> argparse.Namespace:
