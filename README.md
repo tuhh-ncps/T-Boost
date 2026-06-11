@@ -7,7 +7,7 @@ The core idea is simple: real-world event logs often contain highly heterogeneou
 In short:
 
 <p align="center">
-  <img src="proposed_solution.pdf" alt="T-Boost architecture" width="800"/>
+  <img src="solution_overview.png" alt="T-Boost architecture" width="800"/>
 </p>
 
 <p align="center">
