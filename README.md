@@ -1,240 +1,532 @@
-# T-Boost: Temporal Boosting for Next Event Time Prediction
+# T-Boost: Temporal Boosting for Next-Event Time Prediction
 
-Utilities for process-mining experiments on event logs. The scripts in `scripts/` cover preprocessing, exploratory analysis, model training, evaluation, and plotting.
+T-Boost is a lightweight predictive process monitoring pipeline for **next-event time prediction** on event logs.
 
-## Recommended order
+The core idea is simple: real-world event logs often contain highly heterogeneous waiting times, ranging from seconds to days or months. Instead of forcing one regression model to learn all temporal scales blindly, T-Boost first estimates the likely **temporal scale** of the next event and then uses these soft temporal-scale probabilities as additional features for regression.
 
-If you want to run the full pipeline from raw logs to models and plots, use this order:
+In short:
 
-1. Preprocess raw event logs into CSV files.
-2. Train the time-regime classifier.
-3. Train the next-time regressor.
-4. Evaluate the time-regime classifier.
-5. Plot prediction errors.
-6. Run exploratory analysis on the raw XES logs.
+```text
+event log prefix
+      ↓
+temporal-scale classifier
+      ↓
+soft temporal-scale probabilities
+      ↓
+next-event time regressor
+      ↓
+predicted next-event time
+```
 
-You can also skip steps you do not need. For example, `decision_tree_entrypoint.py` runs the two training stages back to back.
+The repository contains scripts for preprocessing event logs, training temporal-scale classifiers, training next-event time regressors, evaluating models, and generating plots.
 
-## Folder vs file input
+---
 
-Most scripts are folder-based and optionally let you narrow to one dataset by name.
+## Method Overview
 
-- Folder + optional dataset name: `data_preprocess.py`, `data_preprocess_per_unit.py`, `decision_tree_time_regime.py`, `decision_tree.py`, `mlp.py`, `decision_tree_entrypoint.py`, `decision_tree_time_regime_eval.py`
-- Direct file path input: `decision_tree_plot.py` via `--input`
-- Folder-only (no single-file flag): `data_analysis.py` scans all `.xes` files in `--data-dir`
+T-Boost consists of two main stages.
+
+### 1. Temporal-scale estimation
+
+Given an event prefix, T-Boost predicts a probability distribution over coarse temporal scales.
+
+For example, the next event may belong to one of several time regimes:
+
+```text
+r1: short delay
+r2: medium-short delay
+r3: medium-long delay
+r4: long delay
+```
+
+The classifier does not output only one hard label. Instead, it outputs soft probabilities:
+
+```text
+[p(r1), p(r2), p(r3), p(r4)]
+```
+
+These probabilities preserve uncertainty between neighboring temporal scales.
+
+### 2. Next-event time regression
+
+The soft temporal-scale probabilities are added as extra features to a regression model. The regressor then predicts the next-event time.
+
+This allows the regression model to adapt its behavior across different temporal scales without requiring a large sequence model such as an LSTM or Transformer.
+
+---
+
+## Repository Structure
+
+```text
+T-Boost/
+├── scripts/
+│   ├── data_preprocess.py
+│   ├── data_preprocess_per_unit.py
+│   ├── data_analysis.py
+│   ├── decision_tree_time_regime.py
+│   ├── decision_tree_time_regime_eval.py
+│   ├── decision_tree.py
+│   ├── decision_tree_entrypoint.py
+│   ├── decision_tree_plot.py
+│   └── mlp.py
+├── pyproject.toml
+├── uv.lock
+└── README.md
+```
+
+Expected local working folders:
+
+```text
+data/        # raw event logs
+data_csv/    # preprocessed CSV files
+results/     # trained models, metrics, predictions, and plots
+```
+
+These folders may need to be created manually before running experiments.
+
+---
+
+## Requirements
+
+The project requires Python 3.11 or newer.
+
+Main dependencies include:
+
+* pandas
+* scikit-learn
+* torch
+* pm4py
+* flwr
+* flwr-datasets
+* onnxscript
+* neutron
+
+The repository includes a `pyproject.toml` and `uv.lock`, so the recommended setup uses `uv`.
+
+---
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/tuhh-ncps/T-Boost.git
+cd T-Boost
+```
+
+Install dependencies with `uv`:
+
+```bash
+uv sync
+```
+
+Alternatively, create a virtual environment manually:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install pandas scikit-learn torch pm4py flwr flwr-datasets onnxscript neutron
+```
+
+---
+
+## Input Data
+
+Place raw event logs inside the `data/` directory.
+
+Supported input formats depend on the preprocessing script, but the pipeline is designed for process-mining event logs such as:
+
+```text
+.xes
+.zip
+.csv
+```
+
+Example:
+
+```text
+data/
+├── BPI12.xes
+├── helpdesk.xes
+└── BPI20.zip
+```
+
+---
+
+## Recommended Pipeline
+
+A typical full run follows this order:
+
+```bash
+python scripts/data_preprocess.py \
+  --data-dir data \
+  --output-dir data_csv
+```
+
+```bash
+python scripts/decision_tree_entrypoint.py \
+  --data-dir data_csv
+```
+
+```bash
+python scripts/mlp.py \
+  --data-dir data_csv \
+  --train-file helpdesk_train_with_time_regime.csv \
+  --test-file helpdesk_test_with_time_regime.csv
+```
+
+```bash
+python scripts/decision_tree_time_regime_eval.py \
+  --data-dir data_csv \
+  --result-dir results/decision_tree_time_regime
+```
+
+```bash
+python scripts/decision_tree_plot.py \
+  --input results/decision_tree/predictions/BPI12_prediction.csv
+```
+
+```bash
+python scripts/data_analysis.py \
+  --data-dir data \
+  --output-dir results/data_analysis
+```
+
+---
 
 ## Scripts
 
 ### `scripts/data_preprocess.py`
 
-Converts raw logs in `data/` into enriched CSV files in `data_csv/`.
-
-Input selection:
-- Use `--data-dir` to point to a folder.
-- Optional: use `--dataset` to process one file inside that folder.
-
-What it produces:
-- one CSV per input file
-- prefix-based features
-- `next_time`, `next_activity`, and `time_regime`
+Converts raw event logs into enriched CSV files for training and testing.
 
 Example:
 
 ```bash
-python scripts/data_preprocess.py --data-dir data --output-dir data_csv
+python scripts/data_preprocess.py \
+  --data-dir data \
+  --output-dir data_csv
 ```
 
 Common options:
-- `--data-dir`: input directory containing `.xes`, `.zip`, or `.csv` files
-- `--output-dir`: output directory for generated CSV files
-- `--time-unit`: `seconds`, `minutes`, `hours`, or `days`
-- `--time-bucket`: optional rounding bucket for temporal features
-- `--dataset`: process only one dataset file
-- `--test-size`: fraction written to the test split
+
+```text
+--data-dir      Input directory containing raw event logs
+--output-dir    Output directory for generated CSV files
+--time-unit     Time unit: seconds, minutes, hours, or days
+--time-bucket   Optional rounding bucket for temporal features
+--dataset       Process only one dataset file
+--test-size     Fraction used for the test split
+```
+
+Outputs:
+
+```text
+data_csv/
+├── <dataset>_train.csv
+└── <dataset>_test.csv
+```
+
+The generated CSV files include prefix-based features, next-event time targets, next-activity targets, and temporal-regime labels.
+
+---
 
 ### `scripts/data_preprocess_per_unit.py`
 
-Creates multiple CSV outputs split by `next_time_seconds` range.
-
-Input selection:
-- Use `--data-dir` to point to a folder.
-- Optional: use `--dataset` to process one file inside that folder.
-
-What it produces:
-- `<dataset>_second.csv`
-- `<dataset>_minute.csv`
-- `<dataset>_hour.csv`
-- `<dataset>_day.csv`
+Creates separate CSV files according to the range of `next_time_seconds`.
 
 Example:
 
 ```bash
-python scripts/data_preprocess_per_unit.py --data-dir data --output-dir data_csv
+python scripts/data_preprocess_per_unit.py \
+  --data-dir data \
+  --output-dir data_csv
 ```
 
-Common options:
-- `--data-dir`
-- `--output-dir`
-- `--time-unit`
-- `--dataset`
+Outputs may include:
+
+```text
+<dataset>_second.csv
+<dataset>_minute.csv
+<dataset>_hour.csv
+<dataset>_day.csv
+```
+
+Use this script when you want to inspect or train on different time-scale subsets separately.
+
+---
 
 ### `scripts/decision_tree_time_regime.py`
 
-Trains a classifier to predict `time_regime` from event context.
-
-Input selection:
-- Use `--data-dir` for the folder containing split CSV files.
-- Optional: use `--dataset` to train only one dataset.
-
-Input:
-- split CSV files in `data_csv/`
-
-Output:
-- model files
-- metrics tables
-- training artifacts under `results/decision_tree_time_regime/`
+Trains the temporal-scale classifier.
 
 Example:
 
 ```bash
-python scripts/decision_tree_time_regime.py --data-dir data_csv --result-dir results/decision_tree_time_regime
+python scripts/decision_tree_time_regime.py \
+  --data-dir data_csv \
+  --result-dir results/decision_tree_time_regime
 ```
+
+Input:
+
+```text
+data_csv/
+```
+
+Output:
+
+```text
+results/decision_tree_time_regime/
+├── models/
+├── metrics/
+└── training artifacts
+```
+
+The trained classifier predicts temporal regimes and produces soft temporal-scale probabilities that can be used by downstream regressors.
+
+---
 
 ### `scripts/decision_tree.py`
 
-Trains a regressor to predict `next_time` from event context.
-
-Input selection:
-- Use `--data-dir` for the folder containing split CSV files.
-- Optional: use `--dataset` to train only one dataset.
-
-Input:
-- split CSV files in `data_csv/`
-
-Output:
-- model files
-- metrics tables
-- predictions and plots under `results/decision_tree/`
+Trains a tree-based regressor for next-event time prediction.
 
 Example:
 
 ```bash
-python scripts/decision_tree.py --data-dir data_csv --result-dir results/decision_tree
+python scripts/decision_tree.py \
+  --data-dir data_csv \
+  --result-dir results/decision_tree
 ```
-
-### `scripts/mlp.py`
-
-Trains a PyTorch MLP regressor to predict `next_time` from event context.
-
-Input selection:
-- Use `--data-dir` for the folder containing split CSV files.
-- Optional: use `--dataset` to train only one dataset.
-- Optional: use `--train-file` and `--test-file` for explicit split files.
-
-Input:
-- split CSV files in `data_csv/`
-- required soft time-regime columns:
-	- `predicted_time_regime_q1_pct`
-	- `predicted_time_regime_q2_pct`
-	- `predicted_time_regime_q3_pct`
 
 Output:
-- model checkpoints under `results/mlp/models/`
-- prediction CSV files under `results/mlp/predictions/`
-- aggregate metrics at `results/mlp/mlp_metrics_all.csv`
 
-Example:
-
-```bash
-python scripts/mlp.py --data-dir data_csv --train-file helpdesk_train_with_time_regime.csv --test-file helpdesk_test_with_time_regime.csv
+```text
+results/decision_tree/
+├── models/
+├── predictions/
+├── plots/
+└── metrics tables
 ```
+
+---
 
 ### `scripts/decision_tree_entrypoint.py`
 
-Runs the two model-training stages in sequence:
+Runs the two tree-based stages back to back:
 
-1. `scripts/decision_tree_time_regime.py`
-2. `scripts/decision_tree.py`
-
-Use this if you want the full training flow with one command.
-
-Input selection:
-- Use `--data-dir` for the folder containing split CSV files.
-- Optional: use `--dataset` to run one dataset.
+1. temporal-scale classifier
+2. next-event time regressor
 
 Example:
 
 ```bash
-python scripts/decision_tree_entrypoint.py --data-dir data_csv --dataset helpdesk.csv
+python scripts/decision_tree_entrypoint.py \
+  --data-dir data_csv \
+  --dataset helpdesk.csv
 ```
+
+Use this when you want the fastest way to execute the tree-based training flow.
+
+---
+
+### `scripts/mlp.py`
+
+Trains a PyTorch MLP regressor for next-event time prediction.
+
+Example:
+
+```bash
+python scripts/mlp.py \
+  --data-dir data_csv \
+  --train-file helpdesk_train_with_time_regime.csv \
+  --test-file helpdesk_test_with_time_regime.csv
+```
+
+The MLP expects the input CSV files to contain soft temporal-regime probability columns:
+
+```text
+predicted_time_regime_q1_pct
+predicted_time_regime_q2_pct
+predicted_time_regime_q3_pct
+```
+
+Output:
+
+```text
+results/mlp/
+├── models/
+├── predictions/
+└── mlp_metrics_all.csv
+```
+
+---
 
 ### `scripts/decision_tree_time_regime_eval.py`
 
-Evaluates the trained time-regime classifier and writes metrics plus a confusion matrix plot.
-
-Input selection:
-- Uses `--data-dir` and `--result-dir` folders.
-- Optional: use `--dataset` to evaluate one dataset stem.
+Evaluates the trained temporal-scale classifier.
 
 Example:
 
 ```bash
-python scripts/decision_tree_time_regime_eval.py --data-dir data_csv --result-dir results/decision_tree_time_regime
+python scripts/decision_tree_time_regime_eval.py \
+  --data-dir data_csv \
+  --result-dir results/decision_tree_time_regime
 ```
+
+Outputs include metrics tables and confusion-matrix plots.
+
+---
 
 ### `scripts/decision_tree_plot.py`
 
-Plots normalized MAE curves from regressor prediction output.
-
-Input selection:
-- Uses `--input` with a direct prediction CSV file path.
-
-Default input:
-- `results/decision_tree/predictions/BPI12_prediction.csv`
+Plots normalized MAE curves from prediction outputs.
 
 Example:
 
 ```bash
-python scripts/decision_tree_plot.py --input results/decision_tree/predictions/BPI12_prediction.csv
+python scripts/decision_tree_plot.py \
+  --input results/decision_tree/predictions/BPI12_prediction.csv
 ```
+
+Default input:
+
+```text
+results/decision_tree/predictions/BPI12_prediction.csv
+```
+
+---
 
 ### `scripts/data_analysis.py`
 
-Runs exploratory process-mining analysis on `.xes` files in `data/`.
-
-Input selection:
-- Uses `--data-dir` only and processes all `.xes` files in that folder.
-- No single-file flag is available in this script.
-
-What it produces per dataset:
-- directly-follows graph PDF
-- last-activity summary CSV
-- sequence-length and execution-time plots
-- variant Pareto plot
-- trace-vs-timespan scatter plot and label mapping CSV
+Runs exploratory process-mining analysis on raw `.xes` logs.
 
 Example:
 
 ```bash
-python scripts/data_analysis.py --data-dir data --output-dir results/data_analysis
+python scripts/data_analysis.py \
+  --data-dir data \
+  --output-dir results/data_analysis
 ```
 
-## Quick pipeline example
+Outputs per dataset may include:
 
-A typical run looks like this:
+```text
+directly-follows graph PDF
+last-activity summary CSV
+sequence-length plots
+execution-time plots
+variant Pareto plot
+trace-vs-timespan scatter plot
+label mapping CSV
+```
+
+This script processes all `.xes` files in the input directory.
+
+---
+
+## Running a Single Dataset
+
+Most scripts support a `--dataset` argument.
+
+Example:
 
 ```bash
-python scripts/data_preprocess.py --data-dir data --output-dir data_csv
-python scripts/decision_tree_entrypoint.py --data-dir data_csv
-python scripts/mlp.py --data-dir data_csv --train-file helpdesk_train_with_time_regime.csv --test-file helpdesk_test_with_time_regime.csv
-python scripts/decision_tree_time_regime_eval.py --data-dir data_csv --result-dir results/decision_tree_time_regime
-python scripts/decision_tree_plot.py --input results/decision_tree/predictions/BPI12_prediction.csv
-python scripts/data_analysis.py --data-dir data --output-dir results/data_analysis
+python scripts/data_preprocess.py \
+  --data-dir data \
+  --output-dir data_csv \
+  --dataset helpdesk.xes
 ```
+
+```bash
+python scripts/decision_tree_entrypoint.py \
+  --data-dir data_csv \
+  --dataset helpdesk.csv
+```
+
+---
+
+## Outputs
+
+Depending on the executed scripts, outputs are written under `results/`.
+
+Typical outputs include:
+
+```text
+results/
+├── decision_tree_time_regime/
+│   ├── models/
+│   ├── metrics/
+│   └── confusion matrices
+├── decision_tree/
+│   ├── models/
+│   ├── predictions/
+│   ├── plots/
+│   └── metrics
+├── mlp/
+│   ├── models/
+│   ├── predictions/
+│   └── mlp_metrics_all.csv
+└── data_analysis/
+    ├── directly-follows graphs
+    ├── activity summaries
+    └── exploratory plots
+```
+
+---
 
 ## Notes
 
-- `data_preprocess.py` and `data_preprocess_per_unit.py` are alternative preprocessing paths. Use the one that matches the dataset format you want.
-- `decision_tree_entrypoint.py` is the fastest way to run both training stages in order.
-- `mlp.py` expects soft time-regime probability columns (`predicted_time_regime_q1_pct`, `predicted_time_regime_q2_pct`, `predicted_time_regime_q3_pct`) in both train and test CSV files.
-- All scripts accept `--help` for the full CLI reference.
+* `data_preprocess.py` and `data_preprocess_per_unit.py` are alternative preprocessing paths.
+* `decision_tree_entrypoint.py` is the fastest way to run the tree-based classifier and regressor stages together.
+* `mlp.py` requires temporal-regime probability columns in both train and test CSV files.
+* `data_analysis.py` is for exploratory analysis and processes all `.xes` files in the selected folder.
+* Every script supports `--help` for the full command-line reference.
+
+Example:
+
+```bash
+python scripts/mlp.py --help
+```
+
+---
+
+## Reproducibility
+
+For reproducible experiments, keep the following fixed:
+
+* dataset preprocessing
+* train/test split
+* temporal-scale construction
+* model hyperparameters
+* random seeds
+* evaluation metric definitions
+
+The recommended structure is:
+
+```text
+raw event logs → preprocessed CSV files → temporal-scale probabilities → regression model → metrics and plots
+```
+
+---
+
+## Citation
+
+If you use this repository, please cite the corresponding paper:
+
+```bibtex
+@inproceedings{tran2026tboost,
+  title     = {T-Boost: Temporal Boosting for Next Event Time Prediction},
+  author    = {Tran, Trinh and Landsiedel, Olaf},
+  booktitle = {AI4BPM 2026},
+  year      = {2026}
+}
+```
+
+---
+
+## License
+
+No license file is currently included in this repository.
+
+Before reusing, modifying, or redistributing the code, please contact the authors or add an explicit open-source license.
