@@ -6,17 +6,13 @@ The core idea is simple: real-world event logs often contain highly heterogeneou
 
 In short:
 
-```text
-event log prefix
-      ↓
-temporal-scale classifier
-      ↓
-soft temporal-scale probabilities
-      ↓
-next-event time regressor
-      ↓
-predicted next-event time
-```
+<p align="center">
+  <img src="proposed_solution.pdf" alt="T-Boost architecture" width="800"/>
+</p>
+
+<p align="center">
+  <em>Overview of the T-Boost architecture.</em>
+</p>
 
 The repository contains scripts for preprocessing event logs, training temporal-scale classifiers, training next-event time regressors, evaluating models, and generating plots.
 
