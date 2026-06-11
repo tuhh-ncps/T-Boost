@@ -57,13 +57,8 @@ This allows the regression model to adapt its behavior across different temporal
 T-Boost/
 ├── scripts/
 │   ├── data_preprocess.py
-│   ├── data_preprocess_per_unit.py
 │   ├── data_analysis.py
 │   ├── decision_tree_time_regime.py
-│   ├── decision_tree_time_regime_eval.py
-│   ├── decision_tree.py
-│   ├── decision_tree_entrypoint.py
-│   ├── decision_tree_plot.py
 │   └── mlp.py
 ├── pyproject.toml
 ├── uv.lock
@@ -160,8 +155,10 @@ python scripts/data_preprocess.py \
 ```
 
 ```bash
-python scripts/decision_tree_entrypoint.py \
-  --data-dir data_csv
+python scripts/decision_tree_time_regime.py \
+  --data-dir data_csv \
+  --train-file bpi_12_w_train.csv \
+  --test-file bpi_12_w_test.csv
 ```
 
 ```bash
@@ -169,17 +166,6 @@ python scripts/mlp.py \
   --data-dir data_csv \
   --train-file helpdesk_train_with_time_regime.csv \
   --test-file helpdesk_test_with_time_regime.csv
-```
-
-```bash
-python scripts/decision_tree_time_regime_eval.py \
-  --data-dir data_csv \
-  --result-dir results/decision_tree_time_regime
-```
-
-```bash
-python scripts/decision_tree_plot.py \
-  --input results/decision_tree/predictions/BPI12_prediction.csv
 ```
 
 ```bash
@@ -227,31 +213,6 @@ The generated CSV files include prefix-based features, next-event time targets, 
 
 ---
 
-### `scripts/data_preprocess_per_unit.py`
-
-Creates separate CSV files according to the range of `next_time_seconds`.
-
-Example:
-
-```bash
-python scripts/data_preprocess_per_unit.py \
-  --data-dir data \
-  --output-dir data_csv
-```
-
-Outputs may include:
-
-```text
-<dataset>_second.csv
-<dataset>_minute.csv
-<dataset>_hour.csv
-<dataset>_day.csv
-```
-
-Use this script when you want to inspect or train on different time-scale subsets separately.
-
----
-
 ### `scripts/decision_tree_time_regime.py`
 
 Trains the temporal-scale classifier.
@@ -261,7 +222,8 @@ Example:
 ```bash
 python scripts/decision_tree_time_regime.py \
   --data-dir data_csv \
-  --result-dir results/decision_tree_time_regime
+  --train-file bpi_12_w_train.csv \
+  --test-file bpi_12_w_test.csv
 ```
 
 Input:
@@ -280,49 +242,6 @@ results/decision_tree_time_regime/
 ```
 
 The trained classifier predicts temporal regimes and produces soft temporal-scale probabilities that can be used by downstream regressors.
-
----
-
-### `scripts/decision_tree.py`
-
-Trains a tree-based regressor for next-event time prediction.
-
-Example:
-
-```bash
-python scripts/decision_tree.py \
-  --data-dir data_csv \
-  --result-dir results/decision_tree
-```
-
-Output:
-
-```text
-results/decision_tree/
-├── models/
-├── predictions/
-├── plots/
-└── metrics tables
-```
-
----
-
-### `scripts/decision_tree_entrypoint.py`
-
-Runs the two tree-based stages back to back:
-
-1. temporal-scale classifier
-2. next-event time regressor
-
-Example:
-
-```bash
-python scripts/decision_tree_entrypoint.py \
-  --data-dir data_csv \
-  --dataset helpdesk.csv
-```
-
-Use this when you want the fastest way to execute the tree-based training flow.
 
 ---
 
@@ -358,41 +277,6 @@ results/mlp/
 
 ---
 
-### `scripts/decision_tree_time_regime_eval.py`
-
-Evaluates the trained temporal-scale classifier.
-
-Example:
-
-```bash
-python scripts/decision_tree_time_regime_eval.py \
-  --data-dir data_csv \
-  --result-dir results/decision_tree_time_regime
-```
-
-Outputs include metrics tables and confusion-matrix plots.
-
----
-
-### `scripts/decision_tree_plot.py`
-
-Plots normalized MAE curves from prediction outputs.
-
-Example:
-
-```bash
-python scripts/decision_tree_plot.py \
-  --input results/decision_tree/predictions/BPI12_prediction.csv
-```
-
-Default input:
-
-```text
-results/decision_tree/predictions/BPI12_prediction.csv
-```
-
----
-
 ### `scripts/data_analysis.py`
 
 Runs exploratory process-mining analysis on raw `.xes` logs.
@@ -421,27 +305,6 @@ This script processes all `.xes` files in the input directory.
 
 ---
 
-## Running a Single Dataset
-
-Most scripts support a `--dataset` argument.
-
-Example:
-
-```bash
-python scripts/data_preprocess.py \
-  --data-dir data \
-  --output-dir data_csv \
-  --dataset helpdesk.xes
-```
-
-```bash
-python scripts/decision_tree_entrypoint.py \
-  --data-dir data_csv \
-  --dataset helpdesk.csv
-```
-
----
-
 ## Outputs
 
 Depending on the executed scripts, outputs are written under `results/`.
@@ -454,11 +317,6 @@ results/
 │   ├── models/
 │   ├── metrics/
 │   └── confusion matrices
-├── decision_tree/
-│   ├── models/
-│   ├── predictions/
-│   ├── plots/
-│   └── metrics
 ├── mlp/
 │   ├── models/
 │   ├── predictions/
@@ -467,22 +325,6 @@ results/
     ├── directly-follows graphs
     ├── activity summaries
     └── exploratory plots
-```
-
----
-
-## Notes
-
-* `data_preprocess.py` and `data_preprocess_per_unit.py` are alternative preprocessing paths.
-* `decision_tree_entrypoint.py` is the fastest way to run the tree-based classifier and regressor stages together.
-* `mlp.py` requires temporal-regime probability columns in both train and test CSV files.
-* `data_analysis.py` is for exploratory analysis and processes all `.xes` files in the selected folder.
-* Every script supports `--help` for the full command-line reference.
-
-Example:
-
-```bash
-python scripts/mlp.py --help
 ```
 
 ---
