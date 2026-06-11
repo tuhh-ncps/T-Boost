@@ -365,6 +365,4 @@ If you use this repository, please cite the corresponding paper:
 
 ## License
 
-No license file is currently included in this repository.
-
-Before reusing, modifying, or redistributing the code, please contact the authors or add an explicit open-source license.
+This project is proprietary. A `LICENSE` file is included in the repository root that describes the terms under which the software may be used.
